@@ -3,6 +3,7 @@
 Alpaca Candlestick Data Collector
 Fetches 5min and 15min candlestick data and stores in local SQLite database.
 Designed to run after market hours to collect last 100 bars of market hours data.
+Enhanced with RSI, Momentum, and Awesome Oscillator for daily bars only.
 """
 
 import sqlite3
@@ -24,7 +25,7 @@ from typing import Dict, List, Tuple, Optional
 load_dotenv()
 # Configuration
 DATABASE_NAME = "E:/database/market_data.db"
-TICKERS_FILE =  "ticker_list.txt"
+TICKERS_FILE = "ticker_list.txt"
 SPECIAL_TICKERS_FILE = "special_ticker_list.txt"
 MAX_BARS = 600
 
@@ -42,6 +43,7 @@ logging.basicConfig(
     ]
 )
 
+
 @dataclass
 class VolumeProfileLevel:
     """Data class for volume profile levels"""
@@ -51,6 +53,7 @@ class VolumeProfileLevel:
     is_poc: bool = False  # Point of Control
     is_value_area: bool = False
 
+
 @dataclass
 class VolumeProfileMetrics:
     """Data class for volume profile metrics"""
@@ -59,6 +62,7 @@ class VolumeProfileMetrics:
     value_area_low: float  # Value Area Low
     total_volume: int
     price_levels: List[VolumeProfileLevel]
+
 
 class AlpacaDataCollector:
     def __init__(self, api_key: str, secret_key: str):
@@ -72,7 +76,7 @@ class AlpacaDataCollector:
         conn = sqlite3.connect(DATABASE_NAME)
         cursor = conn.cursor()
 
-        # Create table for 5min data
+        # Create table for 5min data (without RSI)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS candles_5min (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,7 +96,7 @@ class AlpacaDataCollector:
             )
         ''')
 
-        # Create table for 15min data
+        # Create table for 15min data (without RSI)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS candles_15min (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,7 +116,7 @@ class AlpacaDataCollector:
             )
         ''')
 
-        # Add daily bars table with ATR column
+        # Add daily bars table with ATR, RSI, Momentum, and Awesome Oscillator columns
         cursor.execute('''
                 CREATE TABLE IF NOT EXISTS daily_bars (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,16 +132,21 @@ class AlpacaDataCollector:
                     session_low REAL,
                     poc REAL,
                     atr REAL,
+                    rsi_10 REAL,
+                    momentum_10 REAL
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(symbol, timestamp)
                 )
             ''')
-        # Add columns if not exist (for upgrades)
-        for column in ['session_high', 'session_low', 'poc', 'atr']:
+
+        # Add new columns to daily_bars if not exist (for upgrades)
+        daily_columns = ['session_high', 'session_low', 'poc', 'atr', 'rsi_10', 'momentum_10']
+        for column in daily_columns:
             try:
                 cursor.execute(f'ALTER TABLE daily_bars ADD COLUMN {column} REAL')
             except sqlite3.OperationalError:
-                pass
+                pass  # Column already exists
+
         # Add columns to existing tables if they don't exist
         for column in ['vwap', 'ema_8', 'ema_20', 'ema_39']:
             try:
@@ -164,24 +173,107 @@ class AlpacaDataCollector:
         if not os.path.exists(TICKERS_FILE):
             logging.error(f"Tickers file {TICKERS_FILE} not found")
             return []
-        
+
         with open(TICKERS_FILE, 'r') as f:
             tickers = [line.strip().upper() for line in f if line.strip()]
-        
+
         logging.info(f"Loaded {len(tickers)} tickers: {tickers}")
         return tickers
-    
+
     def is_market_hours(self, timestamp: datetime) -> bool:
         """Check if timestamp is within market hours (6:30 AM to 1:00 PM PST)."""
         # Convert to PST if needed
         if timestamp.tzinfo is None:
             # Assume EST if no timezone info
             timestamp = self.est_tz.localize(timestamp)
-        
+
         pst_time = timestamp.astimezone(self.pst_tz)
         hour_decimal = pst_time.hour + pst_time.minute / 60.0
-        
+
         return MARKET_START_PST <= hour_decimal <= MARKET_END_PST
+
+    def calculate_rsi(self, df: pd.DataFrame, period: int = 10) -> pd.DataFrame:
+        """
+        Calculate RSI (Relative Strength Index) for given period.
+
+        Args:
+            df: DataFrame with price data
+            period: RSI period (default 10)
+
+        Returns:
+            DataFrame with RSI column added
+        """
+        if df.empty or len(df) < period + 1:
+            df['rsi_10'] = np.nan
+            return df
+
+        df = df.copy()
+        df = df.sort_values('timestamp').reset_index(drop=True)
+
+        # Calculate price changes
+        df['price_change'] = df['close'].diff()
+
+        # Separate gains and losses
+        df['gain'] = df['price_change'].apply(lambda x: x if x > 0 else 0)
+        df['loss'] = df['price_change'].apply(lambda x: -x if x < 0 else 0)
+
+        # Calculate initial average gain and loss (SMA for first period)
+        avg_gain = df['gain'].iloc[1:period + 1].mean()
+        avg_loss = df['loss'].iloc[1:period + 1].mean()
+
+        # Initialize lists for average gains and losses
+        avg_gains = [np.nan] * (period + 1)
+        avg_losses = [np.nan] * (period + 1)
+        avg_gains[period] = avg_gain
+        avg_losses[period] = avg_loss
+
+        # Calculate subsequent values using Wilder's smoothing (EMA)
+        for i in range(period + 1, len(df)):
+            avg_gains.append((avg_gains[i - 1] * (period - 1) + df['gain'].iloc[i]) / period)
+            avg_losses.append((avg_losses[i - 1] * (period - 1) + df['loss'].iloc[i]) / period)
+
+        df['avg_gain'] = avg_gains
+        df['avg_loss'] = avg_losses
+
+        # Calculate RS and RSI
+        df['rs'] = df['avg_gain'] / df['avg_loss'].replace(0, np.nan)
+        df['rsi_10'] = 100 - (100 / (1 + df['rs']))
+
+        # Round to 2 decimal places
+        df['rsi_10'] = df['rsi_10'].round(2)
+
+        # Clean up temporary columns
+        df = df.drop(['price_change', 'gain', 'loss', 'avg_gain', 'avg_loss', 'rs'], axis=1)
+
+        return df
+
+    def calculate_momentum(self, df: pd.DataFrame, period: int = 10) -> pd.DataFrame:
+        """
+        Calculate Momentum indicator.
+        Momentum = (Current Close / Close N periods ago) * 100
+
+        Args:
+            df: DataFrame with price data
+            period: Momentum period (default 10)
+
+        Returns:
+            DataFrame with momentum column added
+        """
+        if df.empty or len(df) < period + 1:
+            df['momentum_10'] = np.nan
+            return df
+
+        df = df.copy()
+        df = df.sort_values('timestamp').reset_index(drop=True)
+
+        # Calculate momentum as percentage of price N periods ago
+        df['momentum_10'] = (df['close'] / df['close'].shift(period)) * 100
+
+        # Round to 2 decimal places
+        df['momentum_10'] = df['momentum_10'].round(2)
+
+        return df
+
 
     def get_market_hours_data(self, symbol: str, timeframe: TimeFrame, days_back: int = 10) -> pd.DataFrame:
         """Fetch candlestick data and filter for market hours only."""
@@ -216,9 +308,9 @@ class AlpacaDataCollector:
             # Calculate EMAs
             market_hours_df = self.calculate_ema_series(market_hours_df, [8, 20, 39])
 
-            # Clean up columns
-            available_columns = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'vwap', 'ema_8', 'ema_20',
-                                 'ema_39']
+            # Clean up columns (no RSI for intraday data)
+            available_columns = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                                 'vwap', 'ema_8', 'ema_20', 'ema_39']
             market_hours_df = market_hours_df[available_columns]
 
             logging.info(f"Retrieved {len(market_hours_df)} market hours bars for {symbol} ({timeframe})")
@@ -244,6 +336,7 @@ class AlpacaDataCollector:
             df[f'ema_{period}'] = df[f'ema_{period}'].round(3)
 
         return df
+
     def calculate_vwap_series(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate VWAP for each bar starting from the first bar of each day."""
         if df.empty:
@@ -287,67 +380,74 @@ class AlpacaDataCollector:
 
         return df
 
-    def calculate_atr(self, symbol: str, df: pd.DataFrame, period: int = 10) :
-        """Calculate ATR (Average True Range) for a symbol using historical daily data.
+    def calculate_daily_indicators(self, symbol: str, df: pd.DataFrame, period: int = 10):
+        """
+        Calculate all daily indicators: ATR, RSI, Momentum, and Awesome Oscillator.
 
         Args:
             symbol: Stock symbol
-            current_date: Current date in YYYY-MM-DD format
-            period: ATR period (default 10)
+            df: DataFrame with daily OHLC data
+            period: Period for ATR calculation (default 10)
 
         Returns:
-            ATR value or None if insufficient data
+            DataFrame with all indicators calculated
         """
         try:
-
-
-            if df.empty or len(df) < period + 1:
-                logging.warning(f"Insufficient data for ATR calculation for {symbol}")
-                return None
+            if df.empty:
+                logging.warning(f"Empty dataframe for {symbol}")
+                return df
 
             # Sort by timestamp
             df = df.sort_values('timestamp').reset_index(drop=True)
 
-            # Calculate True Range for each day
-            df['prev_close'] = df['close'].shift(1)
-            df['high_low'] = df['high'] - df['low']
-            df['high_pc'] = abs(df['high'] - df['prev_close'])
-            df['low_pc'] = abs(df['low'] - df['prev_close'])
+            # Calculate ATR
+            if len(df) >= period + 1:
+                # Calculate True Range for each day
+                df['prev_close'] = df['close'].shift(1)
+                df['high_low'] = df['high'] - df['low']
+                df['high_pc'] = abs(df['high'] - df['prev_close'])
+                df['low_pc'] = abs(df['low'] - df['prev_close'])
 
-            # True Range is the maximum of these three values
-            df['true_range'] = df[['high_low', 'high_pc', 'low_pc']].max(axis=1)
+                # True Range is the maximum of these three values
+                df['true_range'] = df[['high_low', 'high_pc', 'low_pc']].max(axis=1)
 
-            # Calculate ATR using Exponential Moving Average (Wilder's method)
-            # First ATR is simple average of first 'period' TR values
-            first_atr = df['true_range'].iloc[1:period + 1].mean()
+                # Calculate ATR using Exponential Moving Average (Wilder's method)
+                # First ATR is simple average of first 'period' TR values
+                first_atr = df['true_range'].iloc[1:period + 1].mean()
 
-            # Initialize ATR values
-            atr_values = [np.nan] * (period + 1)
-            atr_values[period] = first_atr
+                # Initialize ATR values
+                atr_values = [np.nan] * (period + 1)
+                atr_values[period] = first_atr
 
-            # Calculate subsequent ATR values using Wilder's smoothing
-            for i in range(period + 1, len(df)):
-                prev_atr = atr_values[i - 1]
-                current_tr = df['true_range'].iloc[i]
-                # Wilder's smoothing: ATR = ((period - 1) * prev_ATR + current_TR) / period
-                atr_values.append(((period - 1) * prev_atr + current_tr) / period)
+                # Calculate subsequent ATR values using Wilder's smoothing
+                for i in range(period + 1, len(df)):
+                    prev_atr = atr_values[i - 1]
+                    current_tr = df['true_range'].iloc[i]
+                    # Wilder's smoothing: ATR = ((period - 1) * prev_ATR + current_TR) / period
+                    atr_values.append(((period - 1) * prev_atr + current_tr) / period)
 
-            df['atr'] = atr_values
+                df['atr'] = atr_values
+
+                # Clean up ATR temporary columns
+                df = df.drop(['prev_close', 'high_low', 'high_pc', 'low_pc', 'true_range'], axis=1)
+            else:
+                df['atr'] = np.nan
+
+            # Calculate RSI
+            df = self.calculate_rsi(df, period=10)
+
+            # Calculate Momentum
+            df = self.calculate_momentum(df, period=10)
+
+
             return df
+
         except Exception as e:
-            logging.error(f"Failed to calculate ATR for {symbol}: {e}")
-            return None
+            logging.error(f"Failed to calculate daily indicators for {symbol}: {e}")
+            return df
 
     def fetch_daily_bars(self, symbol: str, days_back: int = 40) -> list:
-        """Fetch daily bars for a symbol from Alpaca REST API for the last N days.
-
-        Args:
-            symbol: Stock symbol
-            days_back: Number of days to fetch (default 30)
-
-        Returns:
-            List of daily bars with ATR calculated
-        """
+        """Fetch daily bars for a symbol from Alpaca REST API for the last N days."""
         # Calculate date range
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days_back)
@@ -370,10 +470,12 @@ class AlpacaDataCollector:
 
             # Sort by timestamp
             df = df.sort_values('timestamp').reset_index(drop=True)
-            df = self.calculate_atr(symbol, df)
+
+            # Calculate all daily indicators
+            df = self.calculate_daily_indicators(symbol, df)
+
             result = []
             for _, row in df.iterrows():
-                # Calculate ATR for this date
                 date_str = row["timestamp"].date().isoformat()
                 result.append({
                     "symbol": row["symbol"],
@@ -384,10 +486,12 @@ class AlpacaDataCollector:
                     "close": row["close"],
                     "volume": row["volume"],
                     "vwap": row.get("vwap", None),
-                    "atr": row["atr"]
+                    "atr": row.get("atr", None),
+                    "rsi_10": row.get("rsi_10", None),
+                    "momentum_10": row.get("momentum_10", None)
                 })
 
-            logging.info(f"Fetched {len(result)} daily bars for {symbol}")
+            logging.info(f"Fetched {len(result)} daily bars for {symbol} with technical indicators")
             return result
         except Exception as e:
             logging.error(f"Failed to fetch daily bars for {symbol}: {e}")
@@ -541,26 +645,14 @@ class AlpacaDataCollector:
             price_levels=profile_levels
         )
 
-    def store_daily_bars(self, ticker: str,  bars: list, incremental: bool = False):
-        """Store daily bars in the database, including session stats and ATR.
-        Deletes existing data for the symbol before inserting new data.
-        """
+    def store_daily_bars(self, ticker: str, bars: list, incremental: bool = False):
+        """Store daily bars in the database, including session stats and technical indicators."""
         if not bars:
             return
 
         conn = sqlite3.connect(DATABASE_NAME)
         cursor = conn.cursor()
 
-        # # Get unique symbols from the bars
-        # symbols = list(set(bar["symbol"] for bar in bars))
-        #
-        # # Delete existing data for these symbols (same pattern as store_data method)
-        # if symbols:
-        #     placeholders = ','.join(['?' for _ in symbols])
-        #     cursor.execute(f'DELETE FROM daily_bars WHERE symbol IN ({placeholders})', symbols)
-        #     logging.info(f"Deleted existing daily bars for symbols: {symbols}")
-
-        # After
         if incremental == False:
             cursor.execute('DELETE FROM daily_bars WHERE symbol = ?', (ticker,))
 
@@ -568,15 +660,18 @@ class AlpacaDataCollector:
         inserted_count = 0
         for bar in bars:
             # Fetch session stats for this day/symbol
-            highest_high, session_high, session_low, poc = self.fetch_1min_session_stats(bar["symbol"], bar["timestamp"][:10])
+            highest_high, session_high, session_low, poc = self.fetch_1min_session_stats(bar["symbol"],
+                                                                                         bar["timestamp"][:10])
             try:
                 cursor.execute('''
                     INSERT INTO daily_bars
-                    (symbol, timestamp, open, high, low, close, volume, vwap, session_high, session_low, poc, atr)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (symbol, timestamp, open, high, low, close, volume, vwap, session_high, session_low, 
+                     poc, atr, rsi_10, momentum_10)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     bar["symbol"], bar["timestamp"], bar["open"], highest_high, bar["low"],
-                    bar["close"], bar["volume"], bar["vwap"], session_high, session_low, poc, bar.get("atr")
+                    bar["close"], bar["volume"], bar["vwap"], session_high, session_low, poc,
+                    bar.get("atr"), bar.get("rsi_10"), bar.get("momentum_10")
                 ))
                 inserted_count += 1
             except Exception as e:
@@ -585,50 +680,50 @@ class AlpacaDataCollector:
         conn.commit()
         conn.close()
         logging.info(f"Stored {inserted_count} daily bars in the database")
+
     def store_data(self, df: pd.DataFrame, table_name: str):
         """Store dataframe in the specified table."""
         if df.empty:
             return
-        
+
         conn = sqlite3.connect(DATABASE_NAME)
-        
+
         try:
             # Clear existing data for these symbols to avoid duplicates
             symbols = df['symbol'].unique()
             placeholders = ','.join(['?' for _ in symbols])
             conn.execute(f'DELETE FROM {table_name} WHERE symbol IN ({placeholders})', symbols)
-            
+
             # Insert new data
             df.to_sql(table_name, conn, if_exists='append', index=False)
             logging.info(f"Stored {len(df)} records in {table_name}")
-            
+
         except Exception as e:
             logging.error(f"Error storing data in {table_name}: {str(e)}")
         finally:
             conn.close()
-    
+
     def collect_all_data(self, incremental: bool = False):
         """Main method to collect data for all tickers and timeframes."""
         logging.info("Starting data collection process")
-        
+
         # Setup database
         self.setup_database()
-        
+
         # Load tickers
         tickers = self.load_tickers()
         if not tickers:
             logging.error("No tickers to process")
             return
 
-        
         # Process each ticker
         for ticker in tickers:
             logging.info(f"Processing {ticker}")
-            # Fetch and store daily bars
+            # Fetch and store daily bars with technical indicators
             daily_bars = self.fetch_daily_bars(ticker, incremental == False and 40 or 1)
 
             self.store_daily_bars(ticker, daily_bars, incremental)
-            
+
             # Get 5-minute data
             df_5min = self.get_market_hours_data(ticker, TimeFrame(5, TimeFrameUnit.Minute))
             if not df_5min.empty:
@@ -638,7 +733,7 @@ class AlpacaDataCollector:
             df_15min = self.get_market_hours_data(ticker, TimeFrame(15, TimeFrameUnit.Minute))
             if not df_15min.empty:
                 self.store_data(df_15min, 'candles_15min')
-        
+
         logging.info("Data collection completed")
 
     def get_data_summary(self):
@@ -673,7 +768,7 @@ class AlpacaDataCollector:
             avg_ema_20_str = f"{avg_ema_20:.2f}" if avg_ema_20 else "N/A"
             avg_ema_39_str = f"{avg_ema_39:.2f}" if avg_ema_39 else "N/A"
             print(
-                f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_vwap_str:<10} {avg_ema_20_str:<10} {avg_ema_39_str:<10}")
+                f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_vwap_str:<10} {avg_ema_8_str:<10} {avg_ema_20_str:<10} {avg_ema_39_str:<10}")
 
         # 15-minute data summary
         cursor = conn.execute('''
@@ -699,41 +794,81 @@ class AlpacaDataCollector:
         for row in cursor.fetchall():
             symbol, bar_count, earliest, latest, avg_vwap, avg_ema_8, avg_ema_20, avg_ema_39 = row
             avg_vwap_str = f"{avg_vwap:.2f}" if avg_vwap else "N/A"
-            avg_ema_20_str = f"{avg_ema_8:.2f}" if avg_ema_8 else "N/A"
+            avg_ema_8_str = f"{avg_ema_8:.2f}" if avg_ema_8 else "N/A"
             avg_ema_20_str = f"{avg_ema_20:.2f}" if avg_ema_20 else "N/A"
             avg_ema_39_str = f"{avg_ema_39:.2f}" if avg_ema_39 else "N/A"
             print(
-                f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_vwap_str:<10} {avg_ema_20_str:<10} {avg_ema_39_str:<10}")
+                f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_vwap_str:<10} {avg_ema_8_str:<10} {avg_ema_20_str:<10} {avg_ema_39_str:<10}")
 
-        conn.close()
+        # Daily bars summary with technical indicators
+        cursor = conn.execute('''
+            SELECT symbol,
+                   COUNT(*) as bar_count,
+                   MIN(timestamp) as earliest,
+                   MAX(timestamp) as latest,
+                   AVG(atr) as avg_atr,
+                   AVG(rsi_10) as avg_rsi,
+                   AVG(momentum_10) as avg_momentum 
+            FROM daily_bars
+            GROUP BY symbol
+        ''')
 
-    def get_ema_analysis(self, symbol: str, table_name: str = 'candles_5min', limit: int = 10):
-        """Get latest EMA values and crossover signals for a symbol."""
+        # print("\nDaily Bars Summary:")
+        # print("-" * 140)
+        # print(
+        #     f"{'Symbol':<10} {'Bars':<6} {'Earliest':<20} {'Latest':<20} {'Avg ATR':<10} {'Avg RSI':<10} {'Avg Mom':<10} {'Avg AO':<10}")
+        # print("-" * 140)
+        #
+        # for row in cursor.fetchall():
+        #     symbol, bar_count, earliest, latest, avg_atr, avg_rsi, avg_momentum, avg_ao = row
+        #     avg_atr_str = f"{avg_atr:.2f}" if avg_atr else "N/A"
+        #     avg_rsi_str = f"{avg_rsi:.2f}" if avg_rsi else "N/A"
+        #     avg_mom_str = f"{avg_momentum:.2f}" if avg_momentum else "N/A"
+        #     avg_ao_str = f"{avg_ao:.3f}" if avg_ao else "N/A"
+        #     print(
+        #         f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_atr_str:<10} {avg_rsi_str:<10} {avg_mom_str:<10} {avg_ao_str:<10}")
+        #
+        # conn.close()
+
+    def get_daily_technical_analysis(self, symbol: str, limit: int = 100):
+        """Get latest technical indicators for daily bars."""
         conn = sqlite3.connect(DATABASE_NAME)
 
-        cursor = conn.execute(f'''
-            SELECT timestamp, close, vwap, ema_20, ema_39,
-                   CASE WHEN ema_20 > ema_39 THEN 'Bullish' ELSE 'Bearish' END as signal
-            FROM {table_name}
-            WHERE symbol = ? AND ema_20 IS NOT NULL AND ema_39 IS NOT NULL
+        cursor = conn.execute('''
+            SELECT timestamp, close, atr, rsi_10, momentum_10, 
+                   CASE 
+                       WHEN rsi_10 > 70 THEN 'Overbought'
+                       WHEN rsi_10 < 30 THEN 'Oversold'
+                       ELSE 'Neutral'
+                   END as rsi_signal,
+                   CASE 
+                       WHEN momentum_10 > 100 THEN 'Bullish'
+                       WHEN momentum_10 < 100 THEN 'Bearish'
+                       ELSE 'Neutral'
+                   END as momentum_signal                    
+            FROM daily_bars
+            WHERE symbol = ?
             ORDER BY timestamp DESC
             LIMIT ?
         ''', (symbol, limit))
 
-        print(f"\nEMA Analysis for {symbol} (Latest {limit} bars from {table_name}):")
-        print("-" * 100)
-        print(f"{'Timestamp':<20} {'Close':<8} {'VWAP':<8} {'EMA20':<8} {'EMA39':<8} {'Signal':<8}")
-        print("-" * 100)
+        print(f"\nDaily Technical Analysis for {symbol} (Latest {limit} bars):")
+        print("-" * 150)
+        print(
+            f"{'Date':<12} {'Close':<8} {'ATR':<8} {'RSI(10)':<8} {'RSI Sig':<12} {'Mom(10)':<8} {'Mom Sig':<10} ")
+        print("-" * 150)
 
         for row in cursor.fetchall():
-            timestamp, close, vwap, ema_20, ema_39, signal = row
+            timestamp, close, atr, rsi, momentum, rsi_sig, mom_sig = row
             close_str = f"{close:.2f}" if close else "N/A"
-            vwap_str = f"{vwap:.2f}" if vwap else "N/A"
-            ema_20_str = f"{ema_20:.2f}" if ema_20 else "N/A"
-            ema_39_str = f"{ema_39:.2f}" if ema_39 else "N/A"
-            print(f"{timestamp:<20} {close_str:<8} {vwap_str:<8} {ema_20_str:<8} {ema_39_str:<8} {signal:<8}")
+            atr_str = f"{atr:.2f}" if atr else "N/A"
+            rsi_str = f"{rsi:.2f}" if rsi else "N/A"
+            mom_str = f"{momentum:.2f}" if momentum else "N/A"
+            print(
+                f"{timestamp:<12} {close_str:<8} {atr_str:<8} {rsi_str:<8} {rsi_sig:<12} {mom_str:<8} {mom_sig:<10} ")
 
         conn.close()
+
 
 def main():
     """Main function to run the data collector."""
@@ -741,17 +876,23 @@ def main():
     API_KEY = os.getenv('APCA_API_KEY_ID')
     SECRET_KEY = os.getenv('APCA_API_SECRET_KEY')
     if not API_KEY or not SECRET_KEY:
-        print("Error: Please set ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables")
+        print("Error: Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables")
         print("Or modify the script to include your keys directly")
         return
-    
+
     try:
         collector = AlpacaDataCollector(API_KEY, SECRET_KEY)
         collector.collect_all_data()
         collector.get_data_summary()
-        
+
+        # Example: Get technical analysis for the first ticker
+        tickers = collector.load_tickers()
+        if tickers:
+            collector.get_daily_technical_analysis(tickers[0], 10)
+
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}")
+
 
 if __name__ == "__main__":
     main()

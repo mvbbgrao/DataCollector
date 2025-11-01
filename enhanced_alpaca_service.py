@@ -1,553 +1,1003 @@
-import aiohttp
+#!/usr/bin/env python3
+"""
+Enhanced Alpaca Candlestick Data Collector
+Fetches 5min and 15min candlestick data and stores in local SQLite database.
+Supports both full and incremental sync modes.
+"""
+
 import sqlite3
+from alpaca.data import TimeFrameUnit
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
 import pytz
-from datetime import datetime, timedelta, time
-from typing import List, Dict, Optional
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
-import os
+import logging
 from dotenv import load_dotenv
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
 
+# Load environment variables
 load_dotenv()
-@dataclass
-class ZigZagState:
-    uptrend: Optional[bool] = None
-    tophigh: Optional[float] = None
-    toplow: Optional[float] = None
-    bothigh: Optional[float] = None
-    botlow: Optional[float] = None
-    newtop: bool = False
-    newbot: bool = False
-    changed: bool = False
+
+# Configuration
+DATABASE_NAME = "E:/database/market_data.db"
+TICKERS_FILE = "ticker_list.txt"
+SPECIAL_TICKERS_FILE = "special_ticker_list.txt"
+MAX_BARS = 600
+
+# Market hours in PST (6:30 AM to 1:00 PM PST)
+MARKET_START_PST = 6.5  # 6:30 AM
+MARKET_END_PST = 12.99  # 1:00 PM
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('data_collector.log'),
+        logging.StreamHandler()
+    ]
+)
+
 
 @dataclass
-class ZigZagSignal:
-    timestamp: datetime
-    signal_type: str
-    price: float
-    uptrend: bool
-    barHigh: float
-    barLow: float
-    barVwap: float
-    barOpen: float
-    barClose: float
-    ema20: Optional[float] = None
-    ema39: Optional[float] = None
-    resistance: Optional[float] = None
-    support: Optional[float] = None
-@dataclass
-class Config:
-    API_KEY = os.environ.get("APCA_API_KEY_ID")
-    API_SECRET = os.environ.get("APCA_API_SECRET_KEY")
-    BASE_URL: str = "https://data.alpaca.markets/v2"
-    DATABASE_NAME: str = "e:/database/market_data.db"
+class VolumeProfileLevel:
+    """Data class for volume profile levels"""
+    price_level: float
+    volume: int
+    percentage: float
+    is_poc: bool = False
+    is_value_area: bool = False
 
-class AlpacaService:
-    def __init__(self):
-        self.headers = {
-            "APCA-API-KEY-ID": Config.API_KEY,
-            "APCA-API-SECRET-KEY": Config.API_SECRET
-        }
+
+@dataclass
+class VolumeProfileMetrics:
+    """Data class for volume profile metrics"""
+    poc_price: float
+    value_area_high: float
+    value_area_low: float
+    total_volume: int
+    price_levels: List[VolumeProfileLevel]
+
+
+class AlpacaDataCollector:
+    def __init__(self, api_key: str, secret_key: str):
+        """Initialize the Alpaca data collector."""
+        self.client = StockHistoricalDataClient(api_key, secret_key)
         self.pst_tz = pytz.timezone('US/Pacific')
         self.est_tz = pytz.timezone('US/Eastern')
-        
-        # Market hours in PST (6:30 AM to 1:00 PM PST)
-        self.market_start_pst = time(6, 30)
-        self.market_end_pst = time(13, 0)
-    
-    def is_market_hours(self) -> bool:
-        """Check if current time is within market hours (6:30 AM to 1:00 PM PST)."""
-        now_pst = datetime.now(self.pst_tz).time()
-        
-        # Check if it's a weekday (Monday = 0, Sunday = 6)
-        if datetime.now(self.pst_tz).weekday() >= 5:  # Saturday or Sunday
-            return False
-            
-        return self.market_start_pst <= now_pst <= self.market_end_pst
 
-    def get_database_bars(self, symbol: str, timeframe: str = "15min", limit: int = 100) -> List[Dict]:
-        """Fetch bars from local database with EMA values."""
-        table_name = f"candles_{timeframe}"
+    def setup_database(self):
+        """Create database tables if they don't exist."""
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
 
-        try:
-            conn = sqlite3.connect(Config.DATABASE_NAME)
-            cursor = conn.cursor()
+        # Create table for 5min data
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS candles_5min (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume INTEGER NOT NULL,
+                vwap REAL,
+                ema_8 REAL,
+                ema_20 REAL,
+                ema_39 REAL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, timestamp)
+            )
+        ''')
 
-            query = f"""
-                SELECT timestamp, open, high, low, close, volume, vwap, ema_20, ema_39
-                FROM {table_name}
-                WHERE symbol = ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """
-            # AND timestamp < '2025-08-28 14:14:00+00:00'
-            cursor.execute(query, (symbol.upper(), limit))
-            rows = cursor.fetchall()
+        # Create table for 15min data
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS candles_15min (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume INTEGER NOT NULL,
+                vwap REAL,
+                ema_8 REAL,
+                ema_20 REAL,
+                ema_39 REAL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, timestamp)
+            )
+        ''')
 
-            bars = []
-            for row in rows:
-                bars.append({
-                    'timestamp': datetime.fromisoformat(row[0]),
-                    'open': float(row[1]),
-                    'high': float(row[2]),
-                    'low': float(row[3]),
-                    'close': float(row[4]),
-                    'volume': int(row[5]),
-                    'vwap': float(row[6]) if row[6] is not None else 0.0,
-                    'ema20': float(row[7]) if row[7] is not None else None,
-                    'ema39': float(row[8]) if row[8] is not None else None,
-                })
+        # Add daily bars table with ATR column
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_bars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                timestamp DATE NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume INTEGER NOT NULL,
+                vwap REAL,
+                session_high REAL,
+                session_low REAL,
+                poc REAL,
+                atr REAL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, timestamp)
+            )
+        ''')
 
-            # Reverse to get chronological order (oldest first)
-            bars.reverse()
-            conn.close()
+        # Add columns if not exist (for upgrades)
+        for column in ['session_high', 'session_low', 'poc', 'atr']:
+            try:
+                cursor.execute(f'ALTER TABLE daily_bars ADD COLUMN {column} REAL')
+            except sqlite3.OperationalError:
+                pass
 
-            return bars
+        # Add columns to existing tables if they don't exist
+        for column in ['vwap', 'ema_8', 'ema_20', 'ema_39']:
+            try:
+                cursor.execute(f'ALTER TABLE candles_5min ADD COLUMN {column} REAL')
+            except sqlite3.OperationalError:
+                pass
 
-        except sqlite3.Error as e:
-            print(f"Database error fetching {symbol} bars: {e}")
+            try:
+                cursor.execute(f'ALTER TABLE candles_15min ADD COLUMN {column} REAL')
+            except sqlite3.OperationalError:
+                pass
+
+        # Create indexes for better query performance
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_5min_symbol_timestamp ON candles_5min(symbol, timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_15min_symbol_timestamp ON candles_15min(symbol, timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_daily_symbol_timestamp ON daily_bars(symbol, timestamp)')
+
+        conn.commit()
+        conn.close()
+        logging.info("Database setup completed")
+
+    def load_tickers(self) -> List[str]:
+        """Load tickers from the text file."""
+        if not os.path.exists(TICKERS_FILE):
+            logging.error(f"Tickers file {TICKERS_FILE} not found")
             return []
-        except Exception as e:
-            print(f"Error fetching database bars for {symbol}: {e}")
-            return []
 
-    async def get_realtime_bars(self, symbol: str, timeframe: str, last_ema20: float, last_ema39: float,
-                                since: Optional[datetime] = None) -> List[Dict]:
-        """Fetch real-time bars from Alpaca API and calculate VWAP and incremental EMAs."""
-        url = f"{Config.BASE_URL}/stocks/bars"
-        utc = pytz.UTC
-        today = datetime.now(self.pst_tz).date()
-        dt_pst = self.pst_tz.localize(datetime.combine(today, time(6, 30)))
-        dt_utc = dt_pst.astimezone(utc)
+        with open(TICKERS_FILE, 'r') as f:
+            tickers = [line.strip().upper() for line in f if line.strip()]
 
-        params = {
-            'symbols': symbol,
-            'timeframe': timeframe,
-            'start': dt_utc.isoformat(),
-            'end': datetime.now(utc).isoformat(),
-            'adjustment': 'raw',
-            'sort': 'asc'  # Changed to ascending for chronological order
-        }
+        logging.info(f"Loaded {len(tickers)} tickers: {tickers}")
+        return tickers
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.headers, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        bars = []
-                        current_time_utc = datetime.now(utc)
+    def get_last_timestamp(self, symbol: str, table_name: str) -> Optional[datetime]:
+        """Get the most recent timestamp for a symbol in a table."""
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
 
-                        if symbol in data.get('bars', {}):
-                            raw_bars = []
+        cursor.execute(f'''
+            SELECT MAX(timestamp) 
+            FROM {table_name} 
+            WHERE symbol = ?
+        ''', (symbol,))
 
-                            # First pass: collect and filter bars
-                            for bar in data['bars'][symbol]:
-                                utc_time = datetime.fromisoformat(bar['t'].replace('Z', '+00:00'))
+        result = cursor.fetchone()
+        conn.close()
 
-                                # Skip bars that are too recent
-                                time_diff_seconds = (current_time_utc - utc_time).total_seconds()
-                                if time_diff_seconds < int(timeframe[:-3]) * 60 - 0.1:
-                                    continue
+        if result and result[0]:
+            # Parse the timestamp string to datetime
+            if isinstance(result[0], str):
+                # Handle both datetime and date formats
+                try:
+                    return datetime.fromisoformat(result[0].replace(' ', 'T'))
+                except:
+                    return datetime.strptime(result[0], '%Y-%m-%d')
+            return result[0]
+        return None
 
-                                raw_bars.append({
-                                    'timestamp': utc_time,
-                                    'open': float(bar['o']),
-                                    'high': float(bar['h']),
-                                    'low': float(bar['l']),
-                                    'close': float(bar['c']),
-                                    'volume': int(bar['v'])
-                                })
+    def get_existing_data(self, symbol: str, table_name: str,
+                          start_date: Optional[datetime] = None) -> pd.DataFrame:
+        """Retrieve existing data from database for a symbol."""
+        conn = sqlite3.connect(DATABASE_NAME)
 
-                            # Sort by timestamp to ensure chronological order
-                            raw_bars.sort(key=lambda x: x['timestamp'])
+        query = f'''
+            SELECT * FROM {table_name}
+            WHERE symbol = ?
+        '''
+        params = [symbol]
 
-                            # Second pass: calculate VWAP and incremental EMAs
-                            cumulative_pv = 0
-                            cumulative_volume = 0
-                            current_ema20 = last_ema20 if last_ema20 else None
-                            current_ema39 = last_ema39 if last_ema39 else None
+        if start_date:
+            query += ' AND timestamp >= ?'
+            params.append(start_date.isoformat())
 
-                            # EMA multipliers
-                            alpha_20 = 2 / (20 + 1)  # 0.095238
-                            alpha_39 = 2 / (39 + 1)  # 0.05
+        query += ' ORDER BY timestamp'
 
-                            for bar in raw_bars:
-                                # Calculate typical price for VWAP
-                                typical_price = (bar['high'] + bar['low'] + bar['close']) / 3
+        df = pd.read_sql_query(query, conn, params=params)
+        conn.close()
 
-                                # Update cumulative values for VWAP
-                                cumulative_pv += typical_price * bar['volume']
-                                cumulative_volume += bar['volume']
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
 
-                                # Calculate VWAP
-                                vwap = round(cumulative_pv / cumulative_volume, 2) if cumulative_volume > 0 else 0.00
+        return df
 
-                                # Calculate incremental EMAs
-                                close_price = bar['close']
-
-                                if current_ema20 is not None:
-                                    current_ema20 = round((close_price * alpha_20) + (current_ema20 * (1 - alpha_20)),
-                                                          2)
-                                else:
-                                    current_ema20 = close_price  # First value
-
-                                if current_ema39 is not None:
-                                    current_ema39 = round((close_price * alpha_39) + (current_ema39 * (1 - alpha_39)),
-                                                          2)
-                                else:
-                                    current_ema39 = close_price  # First value
-
-                                # Add calculated values to the bar
-                                bar['vwap'] = vwap
-                                bar['ema20'] = current_ema20
-                                bar['ema39'] = current_ema39
-
-                                bars.append(bar)
-
-                        return bars
-                    else:
-                        print(f"Error fetching bars for {symbol}: {response.status}")
-                        return []
-        except Exception as e:
-            print(f"Exception fetching bars for {symbol}: {e}")
-            return []
-    
-    def is_bar_in_market_hours(self, timestamp: datetime) -> bool:
-        """Check if a bar timestamp is within market hours."""
-        # Convert to PST if needed
+    def is_market_hours(self, timestamp: datetime) -> bool:
+        """Check if timestamp is within market hours."""
         if timestamp.tzinfo is None:
             timestamp = self.est_tz.localize(timestamp)
-        
+
         pst_time = timestamp.astimezone(self.pst_tz)
-        bar_time = pst_time.time()
-        
-        # Check weekday
-        if pst_time.weekday() >= 5:  # Weekend
-            return False
-            
-        return self.market_start_pst <= bar_time <= self.market_end_pst
+        hour_decimal = pst_time.hour + pst_time.minute / 60.0
 
-    async def get_combined_bars(self, symbol: str, timeframe: str = "15min", limit: int = 100) -> List[Dict]:
-        """
-        Get combined bars from database and real-time data.
-        During market hours: database + real-time data
-        After hours: database data only
-        """
-        # Always get database data first
-        db_bars = self.get_database_bars(symbol, timeframe, limit)
+        return MARKET_START_PST <= hour_decimal <= MARKET_END_PST
 
-        # If not in market hours, just return database data
-        if not self.is_market_hours():
-            return db_bars[-limit:] if len(db_bars) > limit else db_bars
+    def get_market_hours_data_incremental(self, symbol: str, timeframe: TimeFrame,
+                                          table_name: str, days_back: int = 10) -> pd.DataFrame:
+        """Fetch candlestick data incrementally based on existing database data."""
 
-        # During market hours, combine with real-time data
-        # Get the timestamp and EMAs of the latest database bar
-        latest_db_timestamp = None
-        latest_bar_ema20 = None
-        latest_bar_ema39 = None
+        # Get the last timestamp from database
+        last_timestamp = self.get_last_timestamp(symbol, table_name)
 
-        if db_bars:
-            latest_db_timestamp = db_bars[-1]['timestamp']
-            latest_bar_ema20 = db_bars[-1].get('ema20')
-            latest_bar_ema39 = db_bars[-1].get('ema39')
+        # Determine start date for fetching new data
+        if last_timestamp:
+            # Start from the last timestamp (will handle duplicates later)
+            start_date = last_timestamp
+            logging.info(f"Incremental sync for {symbol} {timeframe}: Last timestamp in DB is {last_timestamp}")
+        else:
+            # No existing data, fetch from days_back
+            start_date = datetime.now(self.est_tz) - timedelta(days=days_back)
+            logging.info(f"No existing data for {symbol} {timeframe}, fetching last {days_back} days")
 
-        # Fetch real-time data with EMA continuation
-        rt_timeframe = timeframe.replace("min", "Min")  # Convert to API format
-        realtime_bars = await self.get_realtime_bars(
-            symbol,
-            rt_timeframe,
-            latest_bar_ema20 or 0.0,
-            latest_bar_ema39 or 0.0,
-            latest_db_timestamp
+        end_date = datetime.now(self.est_tz)
+
+        # If last timestamp is very recent (within current bar period), skip
+        if last_timestamp:
+            time_diff = end_date.replace(tzinfo=None) - last_timestamp.replace(tzinfo=None)
+            if timeframe.amount == 5 and time_diff < timedelta(minutes=5):
+                logging.info(f"Data for {symbol} {timeframe} is up to date")
+                return pd.DataFrame()
+            elif timeframe.amount == 15 and time_diff < timedelta(minutes=15):
+                logging.info(f"Data for {symbol} {timeframe} is up to date")
+                return pd.DataFrame()
+
+        # Fetch new data from Alpaca
+        request = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=timeframe,
+            start=start_date.isoformat() if hasattr(start_date, 'isoformat') else start_date,
+            end=end_date.isoformat()
         )
 
-        # Combine database and real-time data
-        combined_bars = db_bars.copy()
-
-        # Add real-time bars that are newer than database data
-        for rt_bar in realtime_bars:
-            if not latest_db_timestamp or rt_bar['timestamp'] > latest_db_timestamp:
-                # Check for duplicates based on timestamp
-                if not any(bar['timestamp'] == rt_bar['timestamp'] for bar in combined_bars):
-                    combined_bars.append(rt_bar)
-
-        # Sort by timestamp to ensure chronological order
-        combined_bars.sort(key=lambda x: x['timestamp'])
-
-        # Limit to requested number of bars (keep the most recent ones)
-        if len(combined_bars) > limit:
-            combined_bars = combined_bars[-limit:]
-
-        return combined_bars
-    
-    async def get_5min_bars(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """Get combined 5-minute bars."""
-        return await self.get_combined_bars(symbol, "5min", limit)
-    
-    async def get_15min_bars(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """Get combined 15-minute bars."""
-        return await self.get_combined_bars(symbol, "15min", limit)
-    
-    async def get_last_quote_async(self, session: aiohttp.ClientSession, symbol: str):
-        """Get the latest quote for a symbol."""
-        url = f"{Config.BASE_URL}/stocks/{symbol}/quotes/latest"
         try:
-            async with session.get(url, headers=self.headers) as response:
-                response.raise_for_status()
-                data = await response.json()
-                return data["quote"]
+            bars = self.client.get_stock_bars(request)
+            df_new = bars.df.reset_index()
+
+            if df_new.empty:
+                logging.warning(f"No new data received for {symbol} {timeframe}")
+                return pd.DataFrame()
+
+            # Filter for market hours
+            df_new['is_market_hours'] = df_new['timestamp'].apply(self.is_market_hours)
+            df_new = df_new[df_new['is_market_hours']].copy()
+
+            # Remove duplicates (keep the new data)
+            if last_timestamp:
+                df_new = df_new[df_new['timestamp'] > last_timestamp]
+
+            if df_new.empty:
+                logging.info(f"No new market hours data for {symbol} {timeframe}")
+                return pd.DataFrame()
+
+            # Get existing data for EMA calculation continuity
+            lookback_periods = max([8, 20, 39]) * 2  # Get enough historical data
+            existing_df = self.get_existing_data(symbol, table_name)
+
+            if not existing_df.empty:
+                # Limit existing data to recent records for calculation
+                existing_df = existing_df.tail(lookback_periods)
+
+                # Combine existing and new data for calculation
+                combined_df = pd.concat([existing_df, df_new], ignore_index=True)
+                combined_df = combined_df.sort_values('timestamp').reset_index(drop=True)
+
+                # Calculate indicators on combined data
+                combined_df = self.calculate_vwap_series(combined_df)
+                combined_df = self.calculate_ema_series(combined_df, [8, 20, 39])
+
+                # Extract only the new records with calculated indicators
+                new_records_start_idx = len(existing_df)
+                df_new = combined_df.iloc[new_records_start_idx:].copy()
+            else:
+                # No existing data, calculate from scratch
+                df_new = self.calculate_vwap_series(df_new)
+                df_new = self.calculate_ema_series(df_new, [8, 20, 39])
+
+            # Keep only required columns
+            available_columns = ['symbol', 'timestamp', 'open', 'high', 'low', 'close',
+                                 'volume', 'vwap', 'ema_8', 'ema_20', 'ema_39']
+            df_new = df_new[available_columns]
+
+            # Limit to MAX_BARS if needed (for full sync)
+            if not last_timestamp and len(df_new) > MAX_BARS:
+                df_new = df_new.tail(MAX_BARS)
+
+            logging.info(f"Retrieved {len(df_new)} new market hours bars for {symbol} ({timeframe})")
+            return df_new
+
         except Exception as e:
-            print(f"Error fetching quote for {symbol}: {e}")
+            logging.error(f"Error fetching incremental data for {symbol}: {str(e)}")
+            return pd.DataFrame()
+
+    def get_market_hours_data(self, symbol: str, timeframe: TimeFrame, days_back: int = 10) -> pd.DataFrame:
+        """Fetch candlestick data and filter for market hours only (full sync)."""
+        end_date = datetime.now(self.est_tz)
+        start_date = end_date - timedelta(days=days_back)
+
+        request = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=timeframe,
+            start=start_date.isoformat(),
+            end=end_date.isoformat()
+        )
+
+        try:
+            bars = self.client.get_stock_bars(request)
+            df = bars.df.reset_index()
+
+            if df.empty:
+                logging.warning(f"No data received for {symbol}")
+                return pd.DataFrame()
+
+            # Filter for market hours only
+            df['is_market_hours'] = df['timestamp'].apply(self.is_market_hours)
+            market_hours_df = df[df['is_market_hours']].copy()
+
+            # Keep only the last MAX_BARS
+            market_hours_df = market_hours_df.tail(MAX_BARS)
+
+            # Calculate VWAP for each bar
+            market_hours_df = self.calculate_vwap_series(market_hours_df)
+
+            # Calculate EMAs
+            market_hours_df = self.calculate_ema_series(market_hours_df, [8, 20, 39])
+
+            # Clean up columns
+            available_columns = ['symbol', 'timestamp', 'open', 'high', 'low', 'close',
+                                 'volume', 'vwap', 'ema_8', 'ema_20', 'ema_39']
+            market_hours_df = market_hours_df[available_columns]
+
+            logging.info(f"Retrieved {len(market_hours_df)} market hours bars for {symbol} ({timeframe})")
+            return market_hours_df
+
+        except Exception as e:
+            logging.error(f"Error fetching data for {symbol}: {str(e)}")
+            return pd.DataFrame()
+
+    def calculate_ema_series(self, df: pd.DataFrame, periods: List[int]) -> pd.DataFrame:
+        """Calculate Exponential Moving Averages for given periods."""
+        if df.empty:
+            return df
+
+        df = df.copy()
+        df = df.sort_values('timestamp').reset_index(drop=True)
+
+        for period in periods:
+            df[f'ema_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
+            df[f'ema_{period}'] = df[f'ema_{period}'].round(3)
+
+        return df
+
+    def calculate_vwap_series(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate VWAP for each bar starting from the first bar of each day."""
+        if df.empty:
+            return df
+
+        df = df.copy()
+        df = df.sort_values('timestamp').reset_index(drop=True)
+
+        # Convert timestamp to date for grouping by day
+        df['date'] = pd.to_datetime(df['timestamp']).dt.date
+        vwap_values = []
+
+        # Group by date and calculate VWAP for each day separately
+        for date, group in df.groupby('date'):
+            cumulative_pv = 0
+            cumulative_volume = 0
+
+            group = group.sort_values('timestamp').reset_index(drop=True)
+
+            for index, row in group.iterrows():
+                typical_price = (row['high'] + row['low'] + row['close']) / 3
+                volume = row['volume']
+
+                cumulative_pv += typical_price * volume
+                cumulative_volume += volume
+
+                vwap = round(cumulative_pv / cumulative_volume, 2) if cumulative_volume > 0 else 0.00
+                vwap_values.append(vwap)
+
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        df['vwap'] = vwap_values
+        df = df.drop('date', axis=1)
+
+        return df
+
+    def calculate_atr(self, symbol: str, df: pd.DataFrame, period: int = 10):
+        """Calculate ATR (Average True Range) for a symbol using historical daily data."""
+        try:
+            if df.empty or len(df) < period + 1:
+                logging.warning(f"Insufficient data for ATR calculation for {symbol}")
+                return None
+
+            df = df.sort_values('timestamp').reset_index(drop=True)
+
+            # Calculate True Range
+            df['prev_close'] = df['close'].shift(1)
+            df['high_low'] = df['high'] - df['low']
+            df['high_pc'] = abs(df['high'] - df['prev_close'])
+            df['low_pc'] = abs(df['low'] - df['prev_close'])
+            df['true_range'] = df[['high_low', 'high_pc', 'low_pc']].max(axis=1)
+
+            # Calculate ATR using Wilder's method
+            first_atr = df['true_range'].iloc[1:period + 1].mean()
+
+            atr_values = [np.nan] * (period + 1)
+            atr_values[period] = first_atr
+
+            for i in range(period + 1, len(df)):
+                prev_atr = atr_values[i - 1]
+                current_tr = df['true_range'].iloc[i]
+                atr_values.append(((period - 1) * prev_atr + current_tr) / period)
+
+            df['atr'] = atr_values
+            return df
+        except Exception as e:
+            logging.error(f"Failed to calculate ATR for {symbol}: {e}")
             return None
-    
-    def get_data_info(self, symbol: str) -> Dict:
-        """Get information about available data for a symbol."""
-        info = {"symbol": symbol}
-        
+
+    def fetch_daily_bars_incremental(self, symbol: str) -> list:
+        """Fetch daily bars incrementally based on existing database data."""
+
+        # Get the last daily bar timestamp from database
+        last_timestamp = self.get_last_timestamp(symbol, 'daily_bars')
+
+        if last_timestamp:
+            # Fetch from last timestamp to now
+            start_date = last_timestamp
+            logging.info(f"Incremental sync for {symbol} daily bars: Last date in DB is {last_timestamp}")
+        else:
+            # No existing data, fetch last 40 days
+            start_date = datetime.now() - timedelta(days=40)
+            logging.info(f"No existing daily bars for {symbol}, fetching last 40 days")
+
+        end_date = datetime.now()
+
+        # Check if we need to fetch (skip if last bar is from today)
+        if last_timestamp and last_timestamp.date() >= datetime.now().date():
+            logging.info(f"Daily bars for {symbol} are up to date")
+            return []
+
+        request = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=TimeFrame(1, TimeFrameUnit.Day),
+            start=start_date.isoformat() if hasattr(start_date, 'isoformat') else start_date,
+            end=end_date.isoformat(),
+            feed="iex"
+        )
+
         try:
-            # Check database data
-            for timeframe in ["5min", "15min"]:
-                db_bars = self.get_database_bars(symbol, timeframe, 1000)  # Get all available
-                if db_bars:
-                    info[f"db_{timeframe}"] = {
-                        "count": len(db_bars),
-                        "earliest": db_bars[0]['timestamp'],
-                        "latest": db_bars[-1]['timestamp']
-                    }
-                else:
-                    info[f"db_{timeframe}"] = {"count": 0}
-            
-            # Market status
-            info["market_open"] = self.is_market_hours()
-            info["current_time_pst"] = datetime.now(self.pst_tz)
-            
+            bars = self.client.get_stock_bars(request)
+            df_new = bars.df.reset_index()
+
+            if df_new.empty:
+                logging.warning(f"No new daily bars data received for {symbol}")
+                return []
+
+            # Remove duplicates if any
+            if last_timestamp:
+                df_new = df_new[pd.to_datetime(df_new['timestamp']).dt.date > last_timestamp.date()]
+
+            if df_new.empty:
+                logging.info(f"No new daily bars for {symbol}")
+                return []
+
+            # Get existing data for ATR calculation
+            existing_df = self.get_existing_data(symbol, 'daily_bars')
+
+            if not existing_df.empty:
+                # Combine for ATR calculation
+                combined_df = pd.concat([existing_df.tail(20), df_new], ignore_index=True)
+                combined_df['timestamp'] = pd.to_datetime(combined_df['timestamp'], utc=True)
+                # if combined_df['timestamp'].dt.tz is None:
+                #     combined_df['timestamp'] = combined_df['timestamp'].dt.tz_localize('US/Eastern')
+                combined_df = combined_df.sort_values('timestamp').reset_index(drop=True)
+                combined_df = self.calculate_atr(symbol, combined_df)
+
+                # Extract only new records
+                new_records_start_idx = len(existing_df.tail(20))
+                df_new = combined_df.iloc[new_records_start_idx:].copy()
+            else:
+                df_new = df_new.sort_values('timestamp').reset_index(drop=True)
+                df_new = self.calculate_atr(symbol, df_new)
+
+            result = []
+            for _, row in df_new.iterrows():
+                date_str = pd.to_datetime(row["timestamp"]).date().isoformat()
+                result.append({
+                    "symbol": row.get("symbol", symbol),
+                    "timestamp": date_str,
+                    "open": row["open"],
+                    "high": row["high"],
+                    "low": row["low"],
+                    "close": row["close"],
+                    "volume": row["volume"],
+                    "vwap": row.get("vwap", None),
+                    "atr": row.get("atr", None)
+                })
+
+            logging.info(f"Fetched {len(result)} new daily bars for {symbol}")
+            return result
+
         except Exception as e:
-            print(f"Error getting data info for {symbol}: {e}")
-        
-        return info
-
-class ZigZagIndicator:
-    def __init__(self, use_close_to_confirm: bool = True):
-        self.use_close = use_close_to_confirm
-        self.states: Dict[str, ZigZagState] = {}
-        self.signals: Dict[str, List[ZigZagSignal]] = {}
-
-    import pandas as pd
-
-    def calculate(self, symbol: str, df: pd.DataFrame) -> List[ZigZagSignal]:
-        """
-        Calculate ZigZag signals from a DataFrame.
-        The DataFrame must have columns: 'timestamp', 'open', 'high', 'low', 'close', 'vwap', 'ema20', 'ema39'.
-        """
-        if df.empty or len(df) < 2:
+            logging.error(f"Failed to fetch daily bars for {symbol}: {e}")
             return []
 
-        bars = df.to_dict('records')
-        return self.calculate_zigzag(symbol, bars)
+    def fetch_daily_bars(self, symbol: str, days_back: int = 40) -> list:
+        """Fetch daily bars for a symbol (full sync)."""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days_back)
 
-    def calculate_zigzag(self, symbol: str, bars: List[Dict]) -> List[ZigZagSignal]:
-        if not bars or len(bars) < 2:
+        request = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=TimeFrame(1, TimeFrameUnit.Day),
+            start=start_date.isoformat(),
+            end=end_date.isoformat(),
+            feed="iex"
+        )
+
+        try:
+            bars = self.client.get_stock_bars(request)
+            df = bars.df.reset_index()
+
+            if df.empty:
+                logging.warning(f"No daily bars data received for {symbol}")
+                return []
+
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            df = self.calculate_atr(symbol, df)
+
+            result = []
+            for _, row in df.iterrows():
+                date_str = row["timestamp"].date().isoformat()
+                result.append({
+                    "symbol": row["symbol"],
+                    "timestamp": date_str,
+                    "open": row["open"],
+                    "high": row["high"],
+                    "low": row["low"],
+                    "close": row["close"],
+                    "volume": row["volume"],
+                    "vwap": row.get("vwap", None),
+                    "atr": row["atr"]
+                })
+
+            logging.info(f"Fetched {len(result)} daily bars for {symbol}")
+            return result
+        except Exception as e:
+            logging.error(f"Failed to fetch daily bars for {symbol}: {e}")
             return []
 
-        if symbol not in self.states:
-            self.states[symbol] = ZigZagState()
+    def fetch_1min_session_stats(self, symbol: str, day: str):
+        """Fetch 1-min bars for the session and calculate session high, low, and POC."""
+        est = self.est_tz
+        session_start = est.localize(datetime.strptime(f"{day} 09:30:00", "%Y-%m-%d %H:%M:%S"))
+        session_end = est.localize(datetime.strptime(f"{day} 15:59:00", "%Y-%m-%d %H:%M:%S"))
 
-        if symbol not in self.signals:
-            self.signals[symbol] = []
+        request = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+            start=session_start.isoformat(),
+            end=session_end.isoformat()
+        )
 
-        state = self.states[symbol]
-        signals = []
+        try:
+            bars = self.client.get_stock_bars(request)
+            df = bars.df.reset_index()
+            if df.empty:
+                return None, None, None
+            # Get the highest 'high' value from the bars DataFrame
+            highest_high = df['high'].max()
 
-        for i, bar in enumerate(bars):
-            high = bar['high']
-            low = bar['low']
-            close = bar['close']
-            timestamp = bar['timestamp']
-            vwap = bar['vwap']
+            volume_profile_metrics = self.calculate_volume_profile(df, price_levels=70)
+            session_high = volume_profile_metrics.value_area_high
+            session_low = volume_profile_metrics.value_area_low
+            poc = volume_profile_metrics.poc_price
 
-            if state.uptrend is None:
-                prev_close = bars[i - 1]['close'] if i > 0 else close
-                state.uptrend = close > prev_close
+            return highest_high, session_high, session_low, poc
+        except Exception as e:
+            logging.error(f"Failed to fetch 1-min session stats for {symbol}: {e}")
+            return None, None, None
+
+    def calculate_volume_profile(self, df: pd.DataFrame, price_levels: int = 70) -> VolumeProfileMetrics:
+        """Calculate volume profile from 1-minute data."""
+        if df.empty:
+            raise ValueError("DataFrame is empty")
+
+        high_price = df['high'].max()
+        low_price = df['low'].min()
+        price_range = high_price - low_price
+
+        if price_range == 0:
+            raise ValueError("No price movement in the data")
+
+        price_step = price_range / price_levels
+        price_bins = np.arange(low_price, high_price + price_step, price_step)
+
+        volume_at_price = {}
+
+        for _, row in df.iterrows():
+            bar_low = row['low']
+            bar_high = row['high']
+            bar_volume = row['volume']
+
+            if bar_volume == 0:
                 continue
 
-            state.newtop = False
-            state.newbot = False
-            state.changed = False
+            affected_levels = []
+            for i, price_level in enumerate(price_bins[:-1]):
+                level_high = price_bins[i + 1]
 
-            if state.uptrend:
-                confirmation_condition = (
-                    close < state.toplow if self.use_close
-                    else low < state.toplow
-                ) if state.toplow is not None else False
+                if not (level_high < bar_low or price_level > bar_high):
+                    affected_levels.append(price_level)
 
-                if state.tophigh is None or high > state.tophigh:
-                    state.tophigh = high
-                    state.toplow = low
-                    state.newtop = True
+            if affected_levels:
+                volume_per_level = bar_volume / len(affected_levels)
+                for level in affected_levels:
+                    if level not in volume_at_price:
+                        volume_at_price[level] = 0
+                    volume_at_price[level] += volume_per_level
 
-                # confirmation_condition = (
-                #     close < state.toplow if self.use_close
-                #     else low < state.toplow
-                # ) if state.toplow is not None else False
+        total_volume = sum(volume_at_price.values())
+        profile_levels = []
 
-                if confirmation_condition:
-                    state.bothigh = high
-                    state.botlow = low
-                    state.newbot = True
-                    state.changed = True
-                    state.uptrend = False
+        for price, volume in sorted(volume_at_price.items()):
+            percentage = (volume / total_volume) * 100 if total_volume > 0 else 0
+            profile_levels.append(VolumeProfileLevel(
+                price_level=price,
+                volume=int(volume),
+                percentage=percentage
+            ))
 
-                    signal = ZigZagSignal(
-                        timestamp=timestamp,
-                        signal_type='top_confirmation',
-                        price=high,
-                        uptrend=False,
-                        resistance=state.tophigh,
-                        barHigh=high,
-                        barLow=low,
-                        barVwap=vwap,
-                        barOpen=bar['open'],
-                        barClose=bar['close'],
-                        ema20=bar.get('ema20'),
-                        ema39=bar.get('ema39')
+        poc_level = max(profile_levels, key=lambda x: x.volume)
+        poc_level.is_poc = True
+        poc_price = poc_level.price_level
 
+        value_area_volume = total_volume * 0.72
 
-                    )
-                    signals.append(signal)
+        sorted_by_price = sorted(profile_levels, key=lambda x: x.price_level)
+        poc_index = next(i for i, level in enumerate(sorted_by_price) if level.is_poc)
 
+        current_volume = poc_level.volume
+        low_index = high_index = poc_index
+
+        while current_volume < value_area_volume and (low_index > 0 or high_index < len(sorted_by_price) - 1):
+            expand_low = low_index > 0
+            expand_high = high_index < len(sorted_by_price) - 1
+
+            low_volume = sorted_by_price[low_index - 1].volume if expand_low else 0
+            high_volume = sorted_by_price[high_index + 1].volume if expand_high else 0
+
+            if expand_low and (not expand_high or low_volume >= high_volume):
+                low_index -= 1
+                current_volume += sorted_by_price[low_index].volume
+                sorted_by_price[low_index].is_value_area = True
+            elif expand_high:
+                high_index += 1
+                current_volume += sorted_by_price[high_index].volume
+                sorted_by_price[high_index].is_value_area = True
             else:
-                confirmation_condition = (
-                    close > state.bothigh if self.use_close
-                    else high > state.bothigh
-                ) if state.bothigh is not None else False
+                break
 
-                if state.botlow is None or low < state.botlow:
-                    state.bothigh = high
-                    state.botlow = low
-                    state.newbot = True
+        poc_level.is_value_area = True
 
-                # confirmation_condition = (
-                #     close > state.bothigh if self.use_close
-                #     else high > state.bothigh
-                # ) if state.bothigh is not None else False
+        value_area_high = sorted_by_price[high_index].price_level
+        value_area_low = sorted_by_price[low_index].price_level
 
-                if confirmation_condition:
-                    state.tophigh = high
-                    state.toplow = low
-                    state.changed = True
-                    state.newtop = True
-                    state.uptrend = True
+        return VolumeProfileMetrics(
+            poc_price=round(poc_price, 2),
+            value_area_high=round(value_area_high, 2),
+            value_area_low=round(value_area_low, 2),
+            total_volume=int(total_volume),
+            price_levels=profile_levels
+        )
 
-                    signal = ZigZagSignal(
-                        timestamp=timestamp,
-                        signal_type='bottom_confirmation',
-                        price=low,
-                        uptrend=True,
-                        support=state.botlow,
-                        barHigh=high,
-                        barLow=low,
-                        barVwap=vwap,
-                        barOpen=bar['open'],
-                        barClose=bar['close'],
-                        ema20=bar.get('ema20'),
-                        ema39=bar.get('ema39')
-                    )
-                    signals.append(signal)
-
-        return signals
-
-
-def range_check(low: float, mid: float, high: float, threshold: float) -> bool:
-    """
-    Returns True if both:
-      - Percentage above 'mid'
-      - Percentage below 'low'
-    are greater than the input threshold.
-
-    Otherwise returns False.
-    """
-    if not (low <= mid <= high):
-       return False  # invalid input
-
-    total_range = high - low
-    if total_range == 0:
-        return False  # no range means no distribution
-
-    above_mid = (high - mid) / total_range * 100
-    below_mid = (mid - low) / total_range * 100
-
-    return (above_mid > threshold) and (below_mid > threshold)
-
-
-# Example usage:
-# print(range_check(30.23, 30.68, 30.84, 20))  # should be False since below_low = 0
-
-
-# Example usage function
-async def example_usage():
-    """Example of how to use the enhanced service."""
-    with open("test_ticker_list.txt", 'r') as f:
-        tickers = [line.strip().upper() for line in f if line.strip()]
-
-    service = AlpacaService()
-    for ticker in tickers:
-        symbol = ticker
-        # Get combined 15-minute bars
-        # bars =  await service.get_15min_bars(symbol, limit=50)
-        bars = service.get_database_bars(symbol, limit=50)
-        # print(f"Retrieved {len(bars)} 15-minute bars for {symbol}")
-        # for bar in bars:
-        #     print(f"{symbol} - {bar['timestamp']} : O:{bar['open']} H:{bar['high']} L:{bar['low']} C:{bar['close']} V:{bar['volume']} VWAP:{bar['vwap']} EMA20:{bar.get('ema20')} EMA39:{bar.get('ema39')}")
+    def store_daily_bars(self, ticker: str, bars: list, incremental: bool = False):
+        """Store daily bars in the database with proper incremental handling."""
         if not bars:
-            continue
-        zigzag = ZigZagIndicator(use_close_to_confirm=True)
-        signals = zigzag.calculate_zigzag(symbol, bars)
-        pst_tz = pytz.timezone('US/Pacific')
-        for signal in signals:
-            signal.timestamp = signal.timestamp.astimezone(pst_tz)
+            return
 
-        # print(f"Generated {len(signals)} ZigZag signals for {symbol}")
-        for signal in signals:
-            print(f"{symbol} - {signal.timestamp} : {signal.signal_type} at {signal.price} (Uptrend: {signal.uptrend})")
-            check = range_check(signal.barLow, signal.barVwap, signal.barHigh, threshold=10)
-            if check :
-                print(f"----------{signal.timestamp} - {signal.signal_type} at {signal.price} (Uptrend: {signal.uptrend})")
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
 
-        if not signals:
-            continue
+        inserted_count = 0
+        updated_count = 0
 
-        # Get the most recent bar timestamp for comparison
-        latest_bar = max(bars, key=lambda bar: bar['timestamp'])
-        latest_bar_time = latest_bar['timestamp']
+        for bar in bars:
+            # Check if session stats need to be fetched
+            highest_high, session_high, session_low, poc = self.fetch_1min_session_stats(
+                bar["symbol"], bar["timestamp"][:10]
+            )
 
-        # Filter signals from the latest 5-minute candle (within 5 minutes of latest bar)
-        latest_signals = [
-            s for s in signals
-            if abs((s.timestamp - latest_bar_time).total_seconds()) <= 300  # 5 minutes = 300 seconds
-        ]
+            try:
+                if incremental:
+                    # Try to insert, if it exists update it
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO daily_bars
+                        (symbol, timestamp, open, high, low, close, volume, vwap, 
+                         session_high, session_low, poc, atr)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        bar["symbol"], bar["timestamp"], bar["open"], bar["high"],
+                        bar["low"], bar["close"], bar["volume"], bar["vwap"],
+                        session_high, session_low, poc, bar.get("atr")
+                    ))
+                    if cursor.rowcount > 0:
+                        inserted_count += 1
+                else:
+                    # Full sync - insert normally
+                    cursor.execute('''
+                        INSERT INTO daily_bars
+                        (symbol, timestamp, open, high, low, close, volume, vwap, 
+                         session_high, session_low, poc, atr)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        bar["symbol"], bar["timestamp"], bar["open"], highest_high,
+                        bar["low"], bar["close"], bar["volume"], bar["vwap"],
+                        session_high, session_low, poc, bar.get("atr")
+                    ))
+                    inserted_count += 1
+            except sqlite3.IntegrityError:
+                # Record already exists in incremental mode
+                updated_count += 1
+            except Exception as e:
+                logging.error(f"Error inserting daily bar for {bar['symbol']} on {bar['timestamp']}: {e}")
 
-        for signal in latest_signals:
-            if signal.signal_type == 'bottom_confirmation' :
-                print(f"{signal.timestamp.astimezone(pst_tz)} - {symbol} Bottom at {signal.price} (Uptrend: {signal.uptrend})")
+        conn.commit()
+        conn.close()
+
+        if incremental:
+            logging.info(f"Incremental: Stored/Updated {inserted_count} daily bars, {updated_count} already existed")
+        else:
+            logging.info(f"Stored {inserted_count} daily bars in the database")
+
+    def store_data(self, df: pd.DataFrame, table_name: str, incremental: bool = False):
+        """Store dataframe in the specified table with incremental support."""
+        if df.empty:
+            return
+
+        conn = sqlite3.connect(DATABASE_NAME)
+
+        try:
+            if incremental:
+                # For incremental, use INSERT OR REPLACE
+                df.to_sql(table_name, conn, if_exists='append', index=False, method='multi')
+                logging.info(f"Incrementally stored {len(df)} records in {table_name}")
+            else:
+                # For full sync, clear existing data first
+                symbols = df['symbol'].unique()
+                placeholders = ','.join(['?' for _ in symbols])
+                conn.execute(f'DELETE FROM {table_name} WHERE symbol IN ({placeholders})', symbols)
+
+                # Insert new data
+                df.to_sql(table_name, conn, if_exists='append', index=False)
+                logging.info(f"Stored {len(df)} records in {table_name} (full sync)")
+
+        except Exception as e:
+            logging.error(f"Error storing data in {table_name}: {str(e)}")
+        finally:
+            conn.close()
+
+    def collect_all_data(self, incremental: bool = False):
+        """Main method to collect data for all tickers and timeframes."""
+        logging.info(f"Starting data collection process - Mode: {'INCREMENTAL' if incremental else 'FULL'}")
+
+        # Setup database
+        self.setup_database()
+
+        # Load tickers
+        tickers = self.load_tickers()
+        if not tickers:
+            logging.error("No tickers to process")
+            return
+
+        # Process each ticker
+        for ticker in tickers:
+            logging.info(f"Processing {ticker} - Mode: {'INCREMENTAL' if incremental else 'FULL'}")
+
+            if incremental:
+                # Incremental sync
+                # Fetch and store daily bars incrementally
+                daily_bars = self.fetch_daily_bars_incremental(ticker)
+                self.store_daily_bars(ticker, daily_bars, incremental=True)
+
+                # Get 5-minute data incrementally
+                df_5min = self.get_market_hours_data_incremental(
+                    ticker,
+                    TimeFrame(5, TimeFrameUnit.Minute),
+                    'candles_5min',
+                    days_back=10
+                )
+                if not df_5min.empty:
+                    self.store_data(df_5min, 'candles_5min', incremental=True)
+
+                # Get 15-minute data incrementally  
+                df_15min = self.get_market_hours_data_incremental(
+                    ticker,
+                    TimeFrame(15, TimeFrameUnit.Minute),
+                    'candles_15min',
+                    days_back=10
+                )
+                if not df_15min.empty:
+                    self.store_data(df_15min, 'candles_15min', incremental=True)
+            else:
+                # Full sync (existing logic)
+                daily_bars = self.fetch_daily_bars(ticker, days_back=40)
+
+                # Clear existing data before storing
+                conn = sqlite3.connect(DATABASE_NAME)
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM daily_bars WHERE symbol = ?', (ticker,))
+                conn.commit()
+                conn.close()
+
+                self.store_daily_bars(ticker, daily_bars, incremental=False)
+
+                # Get 5-minute data
+                df_5min = self.get_market_hours_data(ticker, TimeFrame(5, TimeFrameUnit.Minute))
+                if not df_5min.empty:
+                    self.store_data(df_5min, 'candles_5min', incremental=False)
+
+                # Get 15-minute data
+                df_15min = self.get_market_hours_data(ticker, TimeFrame(15, TimeFrameUnit.Minute))
+                if not df_15min.empty:
+                    self.store_data(df_15min, 'candles_15min', incremental=False)
+
+        logging.info(f"Data collection completed - Mode: {'INCREMENTAL' if incremental else 'FULL'}")
+
+    def get_data_summary(self):
+        """Print summary of stored data with EMA information."""
+        conn = sqlite3.connect(DATABASE_NAME)
+
+        # 5-minute data summary
+        cursor = conn.execute('''
+            SELECT symbol,
+                   COUNT(*) as bar_count,
+                   MIN(timestamp) as earliest,
+                   MAX(timestamp) as latest,
+                   AVG(vwap) as avg_vwap,
+                   AVG(ema_8) as avg_ema_8,
+                   AVG(ema_20) as avg_ema_20,
+                   AVG(ema_39) as avg_ema_39
+            FROM candles_5min
+            WHERE vwap IS NOT NULL
+            GROUP BY symbol
+        ''')
+
+        print("\n5-Minute Data Summary:")
+        print("-" * 120)
+        print(
+            f"{'Symbol':<10} {'Bars':<6} {'Earliest':<20} {'Latest':<20} {'Avg VWAP':<10} {'Avg EMA8':<10} {'Avg EMA20':<10} {'Avg EMA39':<10}")
+        print("-" * 120)
+
+        for row in cursor.fetchall():
+            symbol, bar_count, earliest, latest, avg_vwap, avg_ema_8, avg_ema_20, avg_ema_39 = row
+            avg_vwap_str = f"{avg_vwap:.2f}" if avg_vwap else "N/A"
+            avg_ema_8_str = f"{avg_ema_8:.2f}" if avg_ema_8 else "N/A"
+            avg_ema_20_str = f"{avg_ema_20:.2f}" if avg_ema_20 else "N/A"
+            avg_ema_39_str = f"{avg_ema_39:.2f}" if avg_ema_39 else "N/A"
+            print(
+                f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_vwap_str:<10} {avg_ema_8_str:<10} {avg_ema_20_str:<10} {avg_ema_39_str:<10}")
+
+        # 15-minute data summary
+        cursor = conn.execute('''
+            SELECT symbol,
+                   COUNT(*) as bar_count,
+                   MIN(timestamp) as earliest,
+                   MAX(timestamp) as latest,
+                   AVG(vwap) as avg_vwap,
+                   AVG(ema_8) as avg_ema_8,
+                   AVG(ema_20) as avg_ema_20,
+                   AVG(ema_39) as avg_ema_39
+            FROM candles_15min
+            WHERE vwap IS NOT NULL
+            GROUP BY symbol
+        ''')
+
+        print("\n15-Minute Data Summary:")
+        print("-" * 120)
+        print(
+            f"{'Symbol':<10} {'Bars':<6} {'Earliest':<20} {'Latest':<20} {'Avg VWAP':<10} {'Avg EMA8':<10} {'Avg EMA20':<10} {'Avg EMA39':<10}")
+        print("-" * 120)
+
+        for row in cursor.fetchall():
+            symbol, bar_count, earliest, latest, avg_vwap, avg_ema_8, avg_ema_20, avg_ema_39 = row
+            avg_vwap_str = f"{avg_vwap:.2f}" if avg_vwap else "N/A"
+            avg_ema_8_str = f"{avg_ema_8:.2f}" if avg_ema_8 else "N/A"
+            avg_ema_20_str = f"{avg_ema_20:.2f}" if avg_ema_20 else "N/A"
+            avg_ema_39_str = f"{avg_ema_39:.2f}" if avg_ema_39 else "N/A"
+            print(
+                f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_vwap_str:<10} {avg_ema_8_str:<10} {avg_ema_20_str:<10} {avg_ema_39_str:<10}")
+
+        # Daily bars summary
+        cursor = conn.execute('''
+            SELECT symbol,
+                   COUNT(*) as bar_count,
+                   MIN(timestamp) as earliest,
+                   MAX(timestamp) as latest,
+                   AVG(atr) as avg_atr,
+                   AVG(poc) as avg_poc
+            FROM daily_bars
+            GROUP BY symbol
+        ''')
+
+        print("\nDaily Bars Summary:")
+        print("-" * 100)
+        print(f"{'Symbol':<10} {'Bars':<6} {'Earliest':<20} {'Latest':<20} {'Avg ATR':<10} {'Avg POC':<10}")
+        print("-" * 100)
+
+        for row in cursor.fetchall():
+            symbol, bar_count, earliest, latest, avg_atr, avg_poc = row
+            avg_atr_str = f"{avg_atr:.2f}" if avg_atr else "N/A"
+            avg_poc_str = f"{avg_poc:.2f}" if avg_poc else "N/A"
+            print(f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_atr_str:<10} {avg_poc_str:<10}")
+
+        conn.close()
 
 
-    
-    # # Get combined 5-minute bars
-    # bars_5min = await service.get_5min_bars("AAPL", limit=50)
-    # print(f"Retrieved {len(bars_5min)} 5-minute bars for AAPL")
-    #
-    # # Get data info
-    # info = service.get_data_info("AAPL")
-    # print(f"Data info: {info}")
-    #
-    # # Get latest quote (if needed)
-    # async with aiohttp.ClientSession() as session:
-    #     quote = await service.get_last_quote_async(session, "AAPL")
-    #     print(f"Latest quote: {quote}")
+def main():
+    """Main function to run the data collector."""
+    import argparse
+
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Alpaca Data Collector')
+    parser.add_argument('--mode', choices=['full', 'incremental'], default='incremental',
+                        help='Data collection mode: full or incremental (default: incremental)')
+    parser.add_argument('--summary', action='store_true',
+                        help='Show data summary after collection')
+
+    args = parser.parse_args()
+
+    # Load API keys
+    API_KEY = os.getenv('APCA_API_KEY_ID')
+    SECRET_KEY = os.getenv('APCA_API_SECRET_KEY')
+
+    if not API_KEY or not SECRET_KEY:
+        print("Error: Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables")
+        return
+
+    try:
+        collector = AlpacaDataCollector(API_KEY, SECRET_KEY)
+
+        # Run collection based on mode
+        incremental = args.mode == 'incremental'
+        collector.collect_all_data(incremental=incremental)
+
+        # Show summary if requested
+        if args.summary:
+            collector.get_data_summary()
+
+        print(f"\nData collection completed successfully in {args.mode.upper()} mode!")
+
+    except Exception as e:
+        logging.error(f"Fatal error: {str(e)}")
+        print(f"Error: {str(e)}")
+
 
 if __name__ == "__main__":
-    # p = abs(57.299-57.288)
-    # print(p)
-    import asyncio
-    asyncio.run(example_usage())
+    main()

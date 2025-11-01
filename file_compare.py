@@ -67,6 +67,47 @@ def compare_ticker_files(file1: str, file2: str):
     # Show common tickers count
     common_tickers = tickers_file1 & tickers_file2
     print(f"Common tickers: {len(common_tickers)}")
+def remove_duplicates_from_file(filename: str):
+    """Remove duplicate tickers from the file and save unique tickers."""
+    if not os.path.exists(filename):
+        print(f"Error: File '{filename}' not found")
+        return
+
+    tickers = set()
+    with open(filename, 'r', encoding='utf-8') as file:
+        for line in file:
+            ticker = line.strip().upper()
+            if ticker:
+                tickers.add(ticker)
+
+    with open(filename, 'w', encoding='utf-8') as file:
+        for ticker in sorted(tickers):
+            file.write(f"{ticker}\n")
+def remove_tickers_from_file(target_file: str, remove_file: str):
+    """Remove tickers found in remove_file from target_file and save the result."""
+    if not os.path.exists(target_file):
+        print(f"Error: File '{target_file}' not found")
+        return
+    if not os.path.exists(remove_file):
+        print(f"Error: File '{remove_file}' not found")
+        return
+
+    # Read tickers to remove
+    with open(remove_file, 'r', encoding='utf-8') as f:
+        remove_tickers = {line.strip().upper() for line in f if line.strip()}
+
+    # Read target tickers
+    with open(target_file, 'r', encoding='utf-8') as f:
+        target_tickers = {line.strip().upper() for line in f if line.strip()}
+
+    # Remove tickers
+    updated_tickers = target_tickers - remove_tickers
+
+    # Save updated tickers back to target_file
+    with open(target_file, 'w', encoding='utf-8') as f:
+        for ticker in sorted(updated_tickers):
+            f.write(f"{ticker}\n")
+
 
 def main():
     """Main function to run the comparison."""
@@ -77,8 +118,12 @@ def main():
 
     file1 = "ticker_list.txt"
     file2 = "C:/source/MyTradingBot/data/tickers.txt"
+    # remove_duplicates_from_file(file2)
     # file2 = "test_ticker_list.txt"
     compare_ticker_files(file1, file2)
+
+    file3= "data/missing_tickers.txt"
+    remove_tickers_from_file(file2, file3)
 
 if __name__ == "__main__":
     main()
