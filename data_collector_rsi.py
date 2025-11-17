@@ -3,7 +3,7 @@
 Alpaca Candlestick Data Collector
 Fetches 5min and 15min candlestick data and stores in local SQLite database.
 Designed to run after market hours to collect last 100 bars of market hours data.
-Enhanced with RSI, Momentum, and Awesome Oscillator for daily bars only.
+Enhanced with RSI, Momentum, and VWAP bands for daily bars.
 """
 
 import sqlite3
@@ -24,8 +24,8 @@ from typing import Dict, List, Tuple, Optional
 # Load environment variables
 load_dotenv()
 # Configuration
-DATABASE_NAME = "E:/database/market_data.db"
-TICKERS_FILE = "ticker_list.txt"
+DATABASE_NAME = "E:/database/market_data_old.db"
+TICKERS_FILE = "special_ticker_list.txt" #"ticker_list.txt"
 SPECIAL_TICKERS_FILE = "special_ticker_list.txt"
 MAX_BARS = 600
 
@@ -116,7 +116,7 @@ class AlpacaDataCollector:
             )
         ''')
 
-        # Add daily bars table with ATR, RSI, Momentum, and Awesome Oscillator columns
+        # Add daily bars table with ATR, RSI, Momentum, and VWAP bands columns
         cursor.execute('''
                 CREATE TABLE IF NOT EXISTS daily_bars (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,7 +140,8 @@ class AlpacaDataCollector:
             ''')
 
         # Add new columns to daily_bars if not exist (for upgrades)
-        daily_columns = ['session_high', 'session_low', 'poc', 'atr', 'rsi_10', 'momentum_10']
+        daily_columns = ['session_high', 'session_low', 'poc', 'atr', 'rsi_10', 'momentum_10', 'vwap_upper',
+                         'vwap_lower']
         for column in daily_columns:
             try:
                 cursor.execute(f'ALTER TABLE daily_bars ADD COLUMN {column} REAL')
@@ -283,6 +284,7 @@ class AlpacaDataCollector:
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=timeframe,
+            adjustment="all",
             start=start_date.isoformat(),
             end=end_date.isoformat()
         )
@@ -337,8 +339,20 @@ class AlpacaDataCollector:
 
         return df
 
-    def calculate_vwap_series(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate VWAP for each bar starting from the first bar of each day."""
+    def calculate_vwap_series(self, df: pd.DataFrame, include_bands: bool = False,
+                              multiplier: float = 1.5) -> pd.DataFrame:
+        """
+        Calculate VWAP for each bar starting from the first bar of each day.
+        Optionally calculate VWAP bands based on standard deviation.
+
+        Args:
+            df: DataFrame with OHLCV data
+            include_bands: Whether to calculate VWAP upper and lower bands
+            multiplier: Standard deviation multiplier for bands (default 1.5)
+
+        Returns:
+            DataFrame with VWAP (and optionally bands) columns added
+        """
         if df.empty:
             return df
 
@@ -348,12 +362,16 @@ class AlpacaDataCollector:
         # Convert timestamp to date for grouping by day
         df['date'] = df['timestamp'].dt.date
         vwap_values = []
+        vwap_upper_values = []
+        vwap_lower_values = []
 
         # Group by date and calculate VWAP for each day separately
         for date, group in df.groupby('date'):
             # Reset cumulative values for each new day
             cumulative_pv = 0
             cumulative_volume = 0
+            typical_prices = []
+            volumes = []
 
             # Sort by timestamp within the day
             group = group.sort_values('timestamp').reset_index(drop=True)
@@ -363,6 +381,10 @@ class AlpacaDataCollector:
                 typical_price = (row['high'] + row['low'] + row['close']) / 3
                 volume = row['volume']
 
+                # Store for band calculation if needed
+                typical_prices.append(typical_price)
+                volumes.append(volume)
+
                 # Add to cumulative values (reset each day)
                 cumulative_pv += typical_price * volume
                 cumulative_volume += volume
@@ -371,9 +393,45 @@ class AlpacaDataCollector:
                 vwap = round(cumulative_pv / cumulative_volume, 2) if cumulative_volume > 0 else 0.00
                 vwap_values.append(vwap)
 
+                # Calculate bands if requested
+                if include_bands and cumulative_volume > 0:
+                    # Calculate weighted standard deviation up to this point
+                    weighted_squared_deviations = 0
+                    total_volume_so_far = 0
+
+                    # Calculate the current cumulative VWAP for deviation calculation
+                    current_vwap = cumulative_pv / cumulative_volume
+
+                    # Calculate weighted squared deviations for all bars up to this point
+                    for i in range(len(typical_prices)):
+                        if volumes[i] > 0:
+                            deviation = typical_prices[i] - current_vwap
+                            weighted_squared_deviations += (deviation ** 2) * volumes[i]
+                            total_volume_so_far += volumes[i]
+
+                    # Calculate standard deviation
+                    if total_volume_so_far > 0:
+                        variance = weighted_squared_deviations / total_volume_so_far
+                        std_dev = np.sqrt(variance)
+
+                        # Calculate bands
+                        vwap_upper = round(current_vwap + (multiplier * std_dev), 2)
+                        vwap_lower = round(current_vwap - (multiplier * std_dev), 2)
+                    else:
+                        vwap_upper = vwap
+                        vwap_lower = vwap
+
+                    vwap_upper_values.append(vwap_upper)
+                    vwap_lower_values.append(vwap_lower)
+
         # Sort the original dataframe and assign VWAP values
         df = df.sort_values('timestamp').reset_index(drop=True)
         df['vwap'] = vwap_values
+
+        # Add bands if calculated
+        if include_bands:
+            df['vwap_upper'] = vwap_upper_values
+            df['vwap_lower'] = vwap_lower_values
 
         # Remove the helper date column
         df = df.drop('date', axis=1)
@@ -382,7 +440,7 @@ class AlpacaDataCollector:
 
     def calculate_daily_indicators(self, symbol: str, df: pd.DataFrame, period: int = 10):
         """
-        Calculate all daily indicators: ATR, RSI, Momentum, and Awesome Oscillator.
+        Calculate all daily indicators: ATR, RSI, Momentum, and VWAP bands.
 
         Args:
             symbol: Stock symbol
@@ -439,7 +497,6 @@ class AlpacaDataCollector:
             # Calculate Momentum
             df = self.calculate_momentum(df, period=10)
 
-
             return df
 
         except Exception as e:
@@ -477,28 +534,50 @@ class AlpacaDataCollector:
             result = []
             for _, row in df.iterrows():
                 date_str = row["timestamp"].date().isoformat()
+
+                # Fetch all session stats including VWAP bands in one call
+                highest_high, session_high, session_low, poc, vwap_upper, vwap_lower = self.fetch_1min_session_stats(
+                    symbol, date_str
+                )
+
                 result.append({
                     "symbol": row["symbol"],
                     "timestamp": date_str,
                     "open": row["open"],
-                    "high": row["high"],
+                    "high": highest_high if highest_high else row["high"],
                     "low": row["low"],
                     "close": row["close"],
                     "volume": row["volume"],
                     "vwap": row.get("vwap", None),
+                    "vwap_upper": vwap_upper,
+                    "vwap_lower": vwap_lower,
+                    "session_high": session_high,
+                    "session_low": session_low,
+                    "poc": poc,
                     "atr": row.get("atr", None),
                     "rsi_10": row.get("rsi_10", None),
                     "momentum_10": row.get("momentum_10", None)
                 })
 
-            logging.info(f"Fetched {len(result)} daily bars for {symbol} with technical indicators")
+            logging.info(f"Fetched {len(result)} daily bars for {symbol} with technical indicators and VWAP bands")
             return result
         except Exception as e:
             logging.error(f"Failed to fetch daily bars for {symbol}: {e}")
             return []
 
-    def fetch_1min_session_stats(self, symbol: str, day: str):
-        """Fetch 1-min bars for the session and calculate session high, low, and POC."""
+    def fetch_1min_session_stats(self, symbol: str, day: str, multiplier: float = 1.5):
+        """
+        Fetch 1-min bars for the session and calculate session high, low, POC, and VWAP bands.
+        All calculations done in a single pass for efficiency.
+
+        Args:
+            symbol: Stock symbol
+            day: Date string in YYYY-MM-DD format
+            multiplier: Standard deviation multiplier for VWAP bands (default 1.5)
+
+        Returns:
+            Tuple of (highest_high, session_high, session_low, poc, vwap_upper, vwap_lower)
+        """
         # Session times in EST
         est = self.est_tz
         session_start = est.localize(datetime.strptime(f"{day} 09:30:00", "%Y-%m-%d %H:%M:%S"))
@@ -515,19 +594,33 @@ class AlpacaDataCollector:
             bars = self.client.get_stock_bars(request)
             df = bars.df.reset_index()
             if df.empty:
-                return None, None, None, None
+                return None, None, None, None, None, None
+
+            # Get highest high
             highest_high = df['high'].max()
+
+            # Calculate volume profile metrics for session high/low and POC
             volume_profile_metrics = self.calculate_volume_profile(df, price_levels=70)
-            # Session high/low
             session_high = volume_profile_metrics.value_area_high
             session_low = volume_profile_metrics.value_area_low
-
             poc = volume_profile_metrics.poc_price
 
-            return highest_high, session_high, session_low, poc
+            # Calculate VWAP bands using the enhanced method
+            df_with_bands = self.calculate_vwap_series(df, include_bands=True, multiplier=multiplier)
+
+            # Get the final (end of day) VWAP band values
+            if 'vwap_upper' in df_with_bands.columns and 'vwap_lower' in df_with_bands.columns:
+                vwap_upper = df_with_bands['vwap_upper'].iloc[-1]
+                vwap_lower = df_with_bands['vwap_lower'].iloc[-1]
+            else:
+                vwap_upper = None
+                vwap_lower = None
+
+            return highest_high, session_high, session_low, poc, vwap_upper, vwap_lower
+
         except Exception as e:
             logging.error(f"Failed to fetch 1-min session stats for {symbol}: {e}")
-            return None, None, None, None
+            return None, None, None, None, None, None
 
     def calculate_volume_profile(self, df: pd.DataFrame, price_levels: int = 70) -> VolumeProfileMetrics:
         """
@@ -646,7 +739,7 @@ class AlpacaDataCollector:
         )
 
     def store_daily_bars(self, ticker: str, bars: list, incremental: bool = False):
-        """Store daily bars in the database, including session stats and technical indicators."""
+        """Store daily bars in the database, including session stats, VWAP bands, and technical indicators."""
         if not bars:
             return
 
@@ -659,27 +752,26 @@ class AlpacaDataCollector:
         # Insert new daily bars
         inserted_count = 0
         for bar in bars:
-            # Fetch session stats for this day/symbol
-            highest_high, session_high, session_low, poc = self.fetch_1min_session_stats(bar["symbol"],
-                                                                                         bar["timestamp"][:10])
             try:
                 cursor.execute('''
-                    INSERT INTO daily_bars
-                    (symbol, timestamp, open, high, low, close, volume, vwap, session_high, session_low, 
-                     poc, atr, rsi_10, momentum_10)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    bar["symbol"], bar["timestamp"], bar["open"], highest_high, bar["low"],
-                    bar["close"], bar["volume"], bar["vwap"], session_high, session_low, poc,
-                    bar.get("atr"), bar.get("rsi_10"), bar.get("momentum_10")
-                ))
+                               INSERT INTO daily_bars
+                               (symbol, timestamp, open, high, low, close, volume, vwap, vwap_upper, vwap_lower,
+                                session_high, session_low, poc, atr, rsi_10, momentum_10)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               ''', (
+                                   bar["symbol"], bar["timestamp"], bar["open"], bar["high"], bar["low"],
+                                   bar["close"], bar["volume"], bar["vwap"], bar.get("vwap_upper"),
+                                   bar.get("vwap_lower"),
+                                   bar.get("session_high"), bar.get("session_low"), bar.get("poc"),
+                                   bar.get("atr"), bar.get("rsi_10"), bar.get("momentum_10")
+                               ))
                 inserted_count += 1
             except Exception as e:
                 logging.error(f"Error inserting daily bar for {bar['symbol']} on {bar['timestamp']}: {e}")
 
         conn.commit()
         conn.close()
-        logging.info(f"Stored {inserted_count} daily bars in the database")
+        logging.info(f"Stored {inserted_count} daily bars in the database with VWAP bands")
 
     def store_data(self, df: pd.DataFrame, table_name: str):
         """Store dataframe in the specified table."""
@@ -719,7 +811,7 @@ class AlpacaDataCollector:
         # Process each ticker
         for ticker in tickers:
             logging.info(f"Processing {ticker}")
-            # Fetch and store daily bars with technical indicators
+            # Fetch and store daily bars with technical indicators and VWAP bands
             daily_bars = self.fetch_daily_bars(ticker, incremental == False and 40 or 1)
 
             self.store_daily_bars(ticker, daily_bars, incremental)
@@ -742,18 +834,18 @@ class AlpacaDataCollector:
 
         # 5-minute data summary
         cursor = conn.execute('''
-            SELECT symbol,
-                   COUNT(*) as bar_count,
-                   MIN(timestamp) as earliest,
-                   MAX(timestamp) as latest,
-                   AVG(vwap) as avg_vwap,
-                   AVG(ema_8) as avg_ema_8,
-                   AVG(ema_20) as avg_ema_20,
-                   AVG(ema_39) as avg_ema_39
-            FROM candles_5min
-            WHERE vwap IS NOT NULL
-            GROUP BY symbol
-        ''')
+                              SELECT symbol,
+                                     COUNT(*)       as bar_count,
+                                     MIN(timestamp) as earliest,
+                                     MAX(timestamp) as latest,
+                                     AVG(vwap)      as avg_vwap,
+                                     AVG(ema_8)     as avg_ema_8,
+                                     AVG(ema_20)    as avg_ema_20,
+                                     AVG(ema_39)    as avg_ema_39
+                              FROM candles_5min
+                              WHERE vwap IS NOT NULL
+                              GROUP BY symbol
+                              ''')
 
         print("\n5-Minute Data Summary:")
         print("-" * 120)
@@ -772,18 +864,18 @@ class AlpacaDataCollector:
 
         # 15-minute data summary
         cursor = conn.execute('''
-            SELECT symbol,
-                   COUNT(*) as bar_count,
-                   MIN(timestamp) as earliest,
-                   MAX(timestamp) as latest,
-                   AVG(vwap) as avg_vwap,
-                   AVG(ema_8) as avg_ema_8,
-                   AVG(ema_20) as avg_ema_20,
-                   AVG(ema_39) as avg_ema_39
-            FROM candles_15min
-            WHERE vwap IS NOT NULL
-            GROUP BY symbol
-        ''')
+                              SELECT symbol,
+                                     COUNT(*)       as bar_count,
+                                     MIN(timestamp) as earliest,
+                                     MAX(timestamp) as latest,
+                                     AVG(vwap)      as avg_vwap,
+                                     AVG(ema_8)     as avg_ema_8,
+                                     AVG(ema_20)    as avg_ema_20,
+                                     AVG(ema_39)    as avg_ema_39
+                              FROM candles_15min
+                              WHERE vwap IS NOT NULL
+                              GROUP BY symbol
+                              ''')
 
         print("\n15-Minute Data Summary:")
         print("-" * 120)
@@ -800,72 +892,85 @@ class AlpacaDataCollector:
             print(
                 f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_vwap_str:<10} {avg_ema_8_str:<10} {avg_ema_20_str:<10} {avg_ema_39_str:<10}")
 
-        # Daily bars summary with technical indicators
+        # Daily bars summary with technical indicators and VWAP bands
         cursor = conn.execute('''
-            SELECT symbol,
-                   COUNT(*) as bar_count,
-                   MIN(timestamp) as earliest,
-                   MAX(timestamp) as latest,
-                   AVG(atr) as avg_atr,
-                   AVG(rsi_10) as avg_rsi,
-                   AVG(momentum_10) as avg_momentum 
-            FROM daily_bars
-            GROUP BY symbol
-        ''')
+                              SELECT symbol,
+                                     COUNT(*)         as bar_count,
+                                     MIN(timestamp)   as earliest,
+                                     MAX(timestamp)   as latest,
+                                     AVG(atr)         as avg_atr,
+                                     AVG(rsi_10)      as avg_rsi,
+                                     AVG(momentum_10) as avg_momentum,
+                                     AVG(vwap_upper)  as avg_vwap_upper,
+                                     AVG(vwap_lower)  as avg_vwap_lower
+                              FROM daily_bars
+                              GROUP BY symbol
+                              ''')
 
-        # print("\nDaily Bars Summary:")
-        # print("-" * 140)
-        # print(
-        #     f"{'Symbol':<10} {'Bars':<6} {'Earliest':<20} {'Latest':<20} {'Avg ATR':<10} {'Avg RSI':<10} {'Avg Mom':<10} {'Avg AO':<10}")
-        # print("-" * 140)
-        #
-        # for row in cursor.fetchall():
-        #     symbol, bar_count, earliest, latest, avg_atr, avg_rsi, avg_momentum, avg_ao = row
-        #     avg_atr_str = f"{avg_atr:.2f}" if avg_atr else "N/A"
-        #     avg_rsi_str = f"{avg_rsi:.2f}" if avg_rsi else "N/A"
-        #     avg_mom_str = f"{avg_momentum:.2f}" if avg_momentum else "N/A"
-        #     avg_ao_str = f"{avg_ao:.3f}" if avg_ao else "N/A"
-        #     print(
-        #         f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_atr_str:<10} {avg_rsi_str:<10} {avg_mom_str:<10} {avg_ao_str:<10}")
-        #
-        # conn.close()
+        print("\nDaily Bars Summary with VWAP Bands:")
+        print("-" * 160)
+        print(
+            f"{'Symbol':<10} {'Bars':<6} {'Earliest':<20} {'Latest':<20} {'Avg ATR':<10} {'Avg RSI':<10} {'Avg Mom':<10} {'Avg Upper':<12} {'Avg Lower':<12}")
+        print("-" * 160)
 
-    def get_daily_technical_analysis(self, symbol: str, limit: int = 100):
-        """Get latest technical indicators for daily bars."""
+        for row in cursor.fetchall():
+            symbol, bar_count, earliest, latest, avg_atr, avg_rsi, avg_momentum, avg_vwap_upper, avg_vwap_lower = row
+            avg_atr_str = f"{avg_atr:.2f}" if avg_atr else "N/A"
+            avg_rsi_str = f"{avg_rsi:.2f}" if avg_rsi else "N/A"
+            avg_mom_str = f"{avg_momentum:.2f}" if avg_momentum else "N/A"
+            avg_upper_str = f"{avg_vwap_upper:.2f}" if avg_vwap_upper else "N/A"
+            avg_lower_str = f"{avg_vwap_lower:.2f}" if avg_vwap_lower else "N/A"
+            print(
+                f"{symbol:<10} {bar_count:<6} {earliest:<20} {latest:<20} {avg_atr_str:<10} {avg_rsi_str:<10} {avg_mom_str:<10} {avg_upper_str:<12} {avg_lower_str:<12}")
+
+        conn.close()
+
+    def get_daily_technical_analysis(self, symbol: str, limit: int = 10):
+        """Get latest technical indicators for daily bars including VWAP bands."""
         conn = sqlite3.connect(DATABASE_NAME)
 
         cursor = conn.execute('''
-            SELECT timestamp, close, atr, rsi_10, momentum_10, 
+                              SELECT timestamp, close, vwap, vwap_upper, vwap_lower, atr, rsi_10, momentum_10, CASE
+                                  WHEN close > vwap_upper THEN 'Above Upper'
+                                  WHEN close < vwap_lower THEN 'Below Lower'
+                                  ELSE 'Within Bands'
+                              END
+                              as vwap_position,
                    CASE 
                        WHEN rsi_10 > 70 THEN 'Overbought'
                        WHEN rsi_10 < 30 THEN 'Oversold'
                        ELSE 'Neutral'
-                   END as rsi_signal,
+                              END
+                              as rsi_signal,
                    CASE 
                        WHEN momentum_10 > 100 THEN 'Bullish'
                        WHEN momentum_10 < 100 THEN 'Bearish'
                        ELSE 'Neutral'
-                   END as momentum_signal                    
+                              END
+                              as momentum_signal                    
             FROM daily_bars
             WHERE symbol = ?
             ORDER BY timestamp DESC
             LIMIT ?
-        ''', (symbol, limit))
+                              ''', (symbol, limit))
 
         print(f"\nDaily Technical Analysis for {symbol} (Latest {limit} bars):")
-        print("-" * 150)
+        print("-" * 180)
         print(
-            f"{'Date':<12} {'Close':<8} {'ATR':<8} {'RSI(10)':<8} {'RSI Sig':<12} {'Mom(10)':<8} {'Mom Sig':<10} ")
-        print("-" * 150)
+            f"{'Date':<12} {'Close':<8} {'VWAP':<8} {'Upper':<8} {'Lower':<8} {'Position':<13} {'ATR':<8} {'RSI(10)':<8} {'RSI Sig':<12} {'Mom(10)':<8} {'Mom Sig':<10}")
+        print("-" * 180)
 
         for row in cursor.fetchall():
-            timestamp, close, atr, rsi, momentum, rsi_sig, mom_sig = row
+            timestamp, close, vwap, vwap_upper, vwap_lower, atr, rsi, momentum, vwap_pos, rsi_sig, mom_sig = row
             close_str = f"{close:.2f}" if close else "N/A"
+            vwap_str = f"{vwap:.2f}" if vwap else "N/A"
+            upper_str = f"{vwap_upper:.2f}" if vwap_upper else "N/A"
+            lower_str = f"{vwap_lower:.2f}" if vwap_lower else "N/A"
             atr_str = f"{atr:.2f}" if atr else "N/A"
             rsi_str = f"{rsi:.2f}" if rsi else "N/A"
             mom_str = f"{momentum:.2f}" if momentum else "N/A"
             print(
-                f"{timestamp:<12} {close_str:<8} {atr_str:<8} {rsi_str:<8} {rsi_sig:<12} {mom_str:<8} {mom_sig:<10} ")
+                f"{timestamp:<12} {close_str:<8} {vwap_str:<8} {upper_str:<8} {lower_str:<8} {vwap_pos:<13} {atr_str:<8} {rsi_str:<8} {rsi_sig:<12} {mom_str:<8} {mom_sig:<10}")
 
         conn.close()
 

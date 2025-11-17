@@ -118,11 +118,11 @@ def main():
 
     file1 = "ticker_list.txt"
     file2 = "C:/source/MyTradingBot/data/tickers.txt"
-    # remove_duplicates_from_file(file2)
+    #remove_duplicates_from_file(file1)
     # file2 = "test_ticker_list.txt"
     compare_ticker_files(file1, file2)
 
-    file3= "data/missing_tickers.txt"
+    file3= "missing_tickers.txt"
     remove_tickers_from_file(file2, file3)
 
 if __name__ == "__main__":
