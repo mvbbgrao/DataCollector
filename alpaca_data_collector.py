@@ -12,7 +12,7 @@ from alpaca.data.timeframe import TimeFrame
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import pytz
 import logging
 from dotenv import load_dotenv
@@ -27,6 +27,7 @@ from functools import lru_cache
 
 import psycopg2
 from psycopg2.extras import execute_batch
+import json
 
 # Load environment variables
 load_dotenv()
@@ -38,7 +39,7 @@ load_dotenv()
 # Postgres DSN: you can also set via env var MARKET_DATA_PG_DSN
 PG_DSN = os.getenv(
     "MARKET_DATA_PG_DSN",
-    "dbname=market_data user=postgres password=postgres host=localhost port=5432",
+    "dbname=market user=postgres password=postgres host=localhost port=5432",
 )
 
 TICKERS_FILE = "ticker_list.txt"
@@ -95,7 +96,22 @@ class SessionStats:
     poc: float
     vwap_upper: float
     vwap_lower: float
-    session_volume : int
+    session_volume: int
+
+
+@dataclass
+class CompositeSessionProfile:
+    """Composite session profile across multiple days"""
+    symbol: str
+    session_date: date        # as-of date (last day in the window)
+    lookback_days: int        # e.g. 2 or 3
+    composite_poc: float
+    composite_vah: float
+    composite_val: float
+    total_volume: int
+    hvn_levels: List[float]
+    lvn_levels: List[float]
+    imbalance_score: float
 
 
 class AlpacaDataCollectorOptimized:
@@ -202,6 +218,27 @@ class AlpacaDataCollectorOptimized:
                 """
             )
 
+            # composite_session_profiles
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS composite_session_profiles (
+                    id               SERIAL PRIMARY KEY,
+                    symbol           TEXT      NOT NULL,
+                    session_date     DATE      NOT NULL,
+                    lookback_days    SMALLINT  NOT NULL,
+                    composite_poc    DOUBLE PRECISION,
+                    composite_vah    DOUBLE PRECISION,
+                    composite_val    DOUBLE PRECISION,
+                    total_volume     BIGINT,
+                    hvn_levels       JSONB,
+                    lvn_levels       JSONB,
+                    imbalance_score  DOUBLE PRECISION,
+                    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, session_date, lookback_days)
+                );
+                """
+            )
+
             # Indexes
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_5min_symbol_timestamp ON candles_5min(symbol, timestamp);"
@@ -211,6 +248,9 @@ class AlpacaDataCollectorOptimized:
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_daily_symbol_timestamp ON daily_bars(symbol, timestamp);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_csp_symbol_date ON composite_session_profiles(symbol, session_date);"
             )
 
             conn.commit()
@@ -251,7 +291,7 @@ class AlpacaDataCollectorOptimized:
         return MARKET_START_PST <= hour_decimal <= MARKET_END_PST
 
     # -----------------------------------------------------------------------
-    # Indicator calculations (unchanged)
+    # Indicator calculations
     # -----------------------------------------------------------------------
 
     def calculate_rsi(self, df: pd.DataFrame, period: int = 10) -> pd.DataFrame:
@@ -322,8 +362,8 @@ class AlpacaDataCollectorOptimized:
             df["vwap_upper"] = df["vwap"]
             df["vwap_lower"] = df["vwap"]
 
-            for date in df["date"].unique():
-                date_mask = df["date"] == date
+            for date_val in df["date"].unique():
+                date_mask = df["date"] == date_val
                 date_df = df[date_mask]
 
                 if len(date_df) == 0:
@@ -376,23 +416,32 @@ class AlpacaDataCollectorOptimized:
         return df
 
     # -----------------------------------------------------------------------
-    # Session stats & volume profile (unchanged)
+    # Session stats & volume profile
     # -----------------------------------------------------------------------
 
     def fetch_and_process_session_data(
-        self, symbol: str, dates: List[str]
-    ) -> Dict[str, SessionStats]:
-        """Fetch and process multiple days of session data at once."""
+            self, symbol: str, dates: List[str]
+    ) -> Dict[str, Optional[SessionStats]]:
+        """Fetch and process multiple days of session data at once.
+
+        Now also computes and stores composite session profiles (1, 2, 3 days)
+        for each session_date using 1-minute bars.
+        """
         if not dates:
             return {}
 
+        # Convert input strings (YYYY-MM-DD) -> datetime
         dates_dt = [datetime.strptime(d, "%Y-%m-%d") for d in dates]
         start_date = min(dates_dt)
         end_date = max(dates_dt) + timedelta(days=1)
 
         est = self.est_tz
-        session_start = est.localize(datetime.combine(start_date, datetime.min.time()).replace(hour=9, minute=30))
-        session_end = est.localize(datetime.combine(end_date, datetime.min.time()).replace(hour=15, minute=59))
+        session_start = est.localize(
+            datetime.combine(start_date, datetime.min.time()).replace(hour=9, minute=30)
+        )
+        session_end = est.localize(
+            datetime.combine(end_date, datetime.min.time()).replace(hour=15, minute=59)
+        )
 
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
@@ -407,23 +456,87 @@ class AlpacaDataCollectorOptimized:
             df = bars.df.reset_index()
 
             if df.empty:
-                return {date: None for date in dates}
+                return {date_str: None for date_str in dates}
 
-            if "timestamp" in df.columns:
-                df["timestamp"] = pd.to_datetime(df["timestamp"])
-                df["date"] = df["timestamp"].dt.date
-            else:
+            if "timestamp" not in df.columns:
                 logging.error(f"No timestamp column found for {symbol}")
-                return {date: None for date in dates}
+                return {date_str: None for date_str in dates}
 
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df["date"] = df["timestamp"].dt.date
+
+            # VWAP + bands per-day (as before)
             df = self.calculate_vwap_series(df, include_bands=True)
 
-            results = {}
+            results: Dict[str, Optional[SessionStats]] = {}
 
-            # Process each day's data
-            for date_str in dates:
-                date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
-                day_df = df[df["date"] == date_obj].copy()
+            # --- NEW: precompute per-day dataframes in date order ---
+            unique_dates = sorted(df["date"].unique())
+            day_dfs: Dict[date, pd.DataFrame] = {
+                d: df[df["date"] == d].copy() for d in unique_dates
+            }
+
+            # helper to build & store composite profile for a given lookback
+            def _build_and_store_composite(d_idx: int, lookback_days: int):
+                if lookback_days <= 0:
+                    return
+                if d_idx - lookback_days + 1 < 0:
+                    # not enough prior days yet
+                    return
+
+                # Take N consecutive days ending at unique_dates[d_idx]
+                days_window = unique_dates[d_idx - lookback_days + 1: d_idx + 1]
+                comp_df = pd.concat([day_dfs[d] for d in days_window], ignore_index=True)
+
+                if comp_df.empty:
+                    return
+
+                try:
+                    vp = self.calculate_volume_profile_optimized(comp_df, price_levels=70)
+                    vols = vp.price_levels
+                    if not vols:
+                        return
+
+                    # HVN: top 3 by volume
+                    sorted_by_vol = sorted(vols, key=lambda x: x.volume, reverse=True)
+                    hvn_levels = [round(v.price_level, 2) for v in sorted_by_vol[:3]]
+
+                    # LVN: three lowest non-zero volumes
+                    non_zero = [v for v in vols if v.volume > 0]
+                    sorted_low = sorted(non_zero, key=lambda x: x.volume)
+                    lvn_levels = [round(v.price_level, 2) for v in sorted_low[:3]]
+
+                    highs = comp_df["high"].max()
+                    lows = comp_df["low"].min()
+                    mid_price = (highs + lows) / 2.0
+                    width = max(highs - lows, 1e-6)
+                    asym = abs(vp.poc_price - mid_price) / width
+                    imbalance_score = min(100.0, asym * 200.0)  # 0–100
+
+                    session_date_val = unique_dates[d_idx]
+                    profile = CompositeSessionProfile(
+                        symbol=symbol,
+                        session_date=session_date_val,
+                        lookback_days=lookback_days,
+                        composite_poc=vp.poc_price,
+                        composite_vah=vp.value_area_high,
+                        composite_val=vp.value_area_low,
+                        total_volume=vp.total_volume,
+                        hvn_levels=hvn_levels,
+                        lvn_levels=lvn_levels,
+                        imbalance_score=imbalance_score,
+                    )
+                    self._store_composite_session_profile(profile)
+                except Exception as e:
+                    logging.error(
+                        f"Failed composite profile for {symbol} lb={lookback_days} "
+                        f"on {unique_dates[d_idx]}: {e}"
+                    )
+
+            # --- Main per-day loop (build SessionStats + composites) ---
+            for idx, d in enumerate(unique_dates):
+                date_str = d.isoformat()
+                day_df = day_dfs[d]
 
                 if day_df.empty:
                     results[date_str] = None
@@ -431,11 +544,10 @@ class AlpacaDataCollectorOptimized:
 
                 highest_high = day_df["high"].max()
                 total_volume = day_df["volume"].sum()
-                # print(f"{date_obj} - {symbol} total volume: {total_volume}")
+
+                # 1-day profile (same as before, now clearly "lookback 1")
                 try:
-                    volume_profile_metrics = self.calculate_volume_profile_optimized(
-                        day_df
-                    )
+                    volume_profile_metrics = self.calculate_volume_profile_optimized(day_df)
                     session_high = volume_profile_metrics.value_area_high
                     session_low = volume_profile_metrics.value_area_low
                     poc = volume_profile_metrics.poc_price
@@ -472,14 +584,56 @@ class AlpacaDataCollectorOptimized:
                     session_volume=total_volume,
                 )
 
+                # --- NEW: store composite profiles for lookbacks 1, 2, 3 ---
+                # 1-day composite (today only) – we can reuse volume_profile_metrics
+                try:
+                    hvn_levels_1 = []
+                    lvn_levels_1 = []
+                    vols_1 = volume_profile_metrics.price_levels if "volume_profile_metrics" in locals() else []
+                    if vols_1:
+                        sorted_by_vol_1 = sorted(vols_1, key=lambda x: x.volume, reverse=True)
+                        hvn_levels_1 = [round(v.price_level, 2) for v in sorted_by_vol_1[:3]]
+
+                        non_zero_1 = [v for v in vols_1 if v.volume > 0]
+                        sorted_low_1 = sorted(non_zero_1, key=lambda x: x.volume)
+                        lvn_levels_1 = [round(v.price_level, 2) for v in sorted_low_1[:3]]
+
+                    highs_1 = day_df["high"].max()
+                    lows_1 = day_df["low"].min()
+                    mid_price_1 = (highs_1 + lows_1) / 2.0
+                    width_1 = max(highs_1 - lows_1, 1e-6)
+                    asym_1 = abs(volume_profile_metrics.poc_price - mid_price_1) / width_1
+                    imbalance_score_1 = min(100.0, asym_1 * 200.0)
+
+                    profile_1 = CompositeSessionProfile(
+                        symbol=symbol,
+                        session_date=d,
+                        lookback_days=1,
+                        composite_poc=volume_profile_metrics.poc_price,
+                        composite_vah=volume_profile_metrics.value_area_high,
+                        composite_val=volume_profile_metrics.value_area_low,
+                        total_volume=volume_profile_metrics.total_volume,
+                        hvn_levels=hvn_levels_1,
+                        lvn_levels=lvn_levels_1,
+                        imbalance_score=imbalance_score_1,
+                    )
+                    self._store_composite_session_profile(profile_1)
+                except Exception as e:
+                    logging.error(f"Failed composite profile (1-day) for {symbol} on {d}: {e}")
+
+                # 2-day & 3-day & 4-day composites
+                _build_and_store_composite(idx, lookback_days=2)
+                _build_and_store_composite(idx, lookback_days=3)
+                _build_and_store_composite(idx, lookback_days=4)
+
             return results
 
         except Exception as e:
             logging.error(f"Failed to fetch session data for {symbol}: {e}")
-            return {date: None for date in dates}
+            return {date_str: None for date_str in dates}
 
     def calculate_volume_profile_optimized(
-        self, df: pd.DataFrame, price_levels: int = 70
+            self, df: pd.DataFrame, price_levels: int = 70
     ) -> VolumeProfileMetrics:
         """Optimized volume profile calculation using numpy operations."""
         if df.empty:
@@ -489,8 +643,33 @@ class AlpacaDataCollectorOptimized:
         low_price = df["low"].min()
         price_range = high_price - low_price
 
+        # --- NEW: handle days with no price movement gracefully ---
         if price_range == 0:
-            raise ValueError("No price movement in the data")
+            # All trades happened at a single price (or data is synthetic).
+            # Treat this as a degenerate profile with one level.
+            total_volume = int(df["volume"].sum())
+            single_price = float(high_price)  # same as low_price
+
+            profile_levels: List[VolumeProfileLevel] = []
+            if total_volume > 0:
+                profile_levels.append(
+                    VolumeProfileLevel(
+                        price_level=single_price,
+                        volume=total_volume,
+                        percentage=100.0,
+                        is_poc=True,
+                        is_value_area=True,
+                    )
+                )
+
+            return VolumeProfileMetrics(
+                poc_price=round(single_price, 2),
+                value_area_high=round(single_price, 2),
+                value_area_low=round(single_price, 2),
+                total_volume=total_volume,
+                price_levels=profile_levels,
+            )
+        # --- END NEW BLOCK ---
 
         price_bins = np.linspace(low_price, high_price, price_levels + 1)
         volume_at_price = np.zeros(price_levels)
@@ -511,13 +690,13 @@ class AlpacaDataCollectorOptimized:
                 volume_per_bin = bar_volume / len(affected_bins)
                 volume_at_price[affected_bins] += volume_per_bin
 
-        poc_index = np.argmax(volume_at_price)
+        poc_index = int(np.argmax(volume_at_price))
         poc_price = (price_bins[poc_index] + price_bins[poc_index + 1]) / 2
 
-        total_volume = volume_at_price.sum()
+        total_volume = float(volume_at_price.sum())
         value_area_volume = total_volume * 0.7
 
-        current_volume = volume_at_price[poc_index]
+        current_volume = float(volume_at_price[poc_index])
         low_index = high_index = poc_index
 
         while current_volume < value_area_volume:
@@ -540,16 +719,16 @@ class AlpacaDataCollectorOptimized:
         value_area_high = (price_bins[high_index] + price_bins[high_index + 1]) / 2
         value_area_low = (price_bins[low_index] + price_bins[low_index + 1]) / 2
 
-        profile_levels = []
+        profile_levels: List[VolumeProfileLevel] = []
         for i in range(price_levels):
             if volume_at_price[i] > 0:
                 price_level = (price_bins[i] + price_bins[i + 1]) / 2
                 profile_levels.append(
                     VolumeProfileLevel(
-                        price_level=price_level,
+                        price_level=float(price_level),
                         volume=int(volume_at_price[i]),
                         percentage=(
-                            (volume_at_price[i] / total_volume) * 100
+                            (float(volume_at_price[i]) / total_volume) * 100
                             if total_volume > 0
                             else 0
                         ),
@@ -559,15 +738,103 @@ class AlpacaDataCollectorOptimized:
                 )
 
         return VolumeProfileMetrics(
-            poc_price=round(poc_price, 2),
-            value_area_high=round(value_area_high, 2),
-            value_area_low=round(value_area_low, 2),
+            poc_price=round(float(poc_price), 2),
+            value_area_high=round(float(value_area_high), 2),
+            value_area_low=round(float(value_area_low), 2),
             total_volume=int(total_volume),
             price_levels=profile_levels,
         )
 
     # -----------------------------------------------------------------------
-    # Symbol processing / indicators (unchanged)
+    # Composite profile helpers (NEW)
+    # -----------------------------------------------------------------------
+
+    def calculate_composite_profile_from_candles(
+        self, df: pd.DataFrame, price_levels: int = 70
+    ) -> VolumeProfileMetrics:
+        """
+        Build a multi-day composite volume profile using the existing
+        optimized volume profile logic.
+        """
+        return self.calculate_volume_profile_optimized(df, price_levels=price_levels)
+
+    def _store_composite_session_profile(
+            self,
+            profile: CompositeSessionProfile,
+    ):
+        """Upsert a CompositeSessionProfile into Postgres."""
+        conn = self._get_pg_conn()
+        cur = conn.cursor()
+        try:
+            # Make absolutely sure we don't pass any numpy types to JSON/psycopg
+            hvn_levels = [float(x) for x in (profile.hvn_levels or [])]
+            lvn_levels = [float(x) for x in (profile.lvn_levels or [])]
+
+            total_volume = int(profile.total_volume) if profile.total_volume is not None else None
+            imbalance_score = float(profile.imbalance_score) if profile.imbalance_score is not None else None
+            composite_poc = float(profile.composite_poc) if profile.composite_poc is not None else None
+            composite_vah = float(profile.composite_vah) if profile.composite_vah is not None else None
+            composite_val = float(profile.composite_val) if profile.composite_val is not None else None
+
+            cur.execute(
+                """
+                INSERT INTO public.composite_session_profiles (symbol,
+                                                               session_date,
+                                                               lookback_days,
+                                                               composite_poc,
+                                                               composite_vah,
+                                                               composite_val,
+                                                               total_volume,
+                                                               hvn_levels,
+                                                               lvn_levels,
+                                                               imbalance_score)
+                VALUES (%(symbol)s,
+                        %(session_date)s,
+                        %(lookback_days)s,
+                        %(composite_poc)s,
+                        %(composite_vah)s,
+                        %(composite_val)s,
+                        %(total_volume)s,
+                        %(hvn_levels)s,
+                        %(lvn_levels)s,
+                        %(imbalance_score)s) ON CONFLICT (symbol, session_date, lookback_days)
+                DO
+                UPDATE SET
+                    composite_poc = EXCLUDED.composite_poc,
+                    composite_vah = EXCLUDED.composite_vah,
+                    composite_val = EXCLUDED.composite_val,
+                    total_volume = EXCLUDED.total_volume,
+                    hvn_levels = EXCLUDED.hvn_levels,
+                    lvn_levels = EXCLUDED.lvn_levels,
+                    imbalance_score = EXCLUDED.imbalance_score;
+                """,
+                {
+                    "symbol": profile.symbol,
+                    "session_date": profile.session_date,
+                    "lookback_days": int(profile.lookback_days),
+                    "composite_poc": composite_poc,
+                    "composite_vah": composite_vah,
+                    "composite_val": composite_val,
+                    "total_volume": total_volume,
+                    "hvn_levels": json.dumps(hvn_levels),
+                    "lvn_levels": json.dumps(lvn_levels),
+                    "imbalance_score": imbalance_score,
+                },
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(
+                f"Error storing composite profile for {profile.symbol}, "
+                f"session_date={profile.session_date}, lb={profile.lookback_days}: {e}"
+            )
+            raise
+        finally:
+            cur.close()
+            conn.close()
+
+    # -----------------------------------------------------------------------
+    # Symbol processing / indicators
     # -----------------------------------------------------------------------
 
     def process_symbol_batch(self, symbols: List[str], days_back: int = 40) -> Dict[str, List[dict]]:
@@ -575,7 +842,7 @@ class AlpacaDataCollectorOptimized:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days_back)
 
-        all_results = {}
+        all_results: Dict[str, List[dict]] = {}
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_symbol = {
@@ -622,7 +889,7 @@ class AlpacaDataCollectorOptimized:
             dates_to_fetch = [row["timestamp"].date().isoformat() for _, row in df.iterrows()]
             session_stats = self.fetch_and_process_session_data(symbol, dates_to_fetch)
 
-            result = []
+            result: List[dict] = []
             for _, row in df.iterrows():
                 date_str = row["timestamp"].date().isoformat()
                 stats = session_stats.get(date_str)
@@ -677,14 +944,14 @@ class AlpacaDataCollectorOptimized:
         return df
 
     # -----------------------------------------------------------------------
-    # Intraday data fetch (unchanged except storage)
+    # Intraday data fetch
     # -----------------------------------------------------------------------
 
     def get_market_hours_data_batch(
         self, symbols: List[str], timeframe: TimeFrame, days_back: int = 30
     ) -> Dict[str, pd.DataFrame]:
         """Fetch market hours data for multiple symbols in parallel."""
-        results = {}
+        results: Dict[str, pd.DataFrame] = {}
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_symbol = {
@@ -757,7 +1024,7 @@ class AlpacaDataCollectorOptimized:
             return pd.DataFrame()
 
     # -----------------------------------------------------------------------
-    # Storage: now Postgres
+    # Storage: Postgres
     # -----------------------------------------------------------------------
 
     def batch_store_data(self, data_dict: Dict[str, pd.DataFrame], table_name: str):
@@ -769,7 +1036,7 @@ class AlpacaDataCollectorOptimized:
         cur = conn.cursor()
 
         try:
-            all_records = []
+            all_records: List[dict] = []
             symbols_to_delete = set()
 
             for symbol, df in data_dict.items():
@@ -809,7 +1076,7 @@ class AlpacaDataCollectorOptimized:
                     execute_batch(
                         cur,
                         insert_sql,
-                        batched[i : i + DB_BATCH_SIZE],
+                        batched[i: i + DB_BATCH_SIZE],
                         page_size=DB_BATCH_SIZE,
                     )
 
@@ -832,7 +1099,7 @@ class AlpacaDataCollectorOptimized:
         cur = conn.cursor()
 
         try:
-            all_records = []
+            all_records: List[dict] = []
             for symbol, bars in all_bars.items():
                 all_records.extend(bars)
 
@@ -900,7 +1167,7 @@ class AlpacaDataCollectorOptimized:
                 execute_batch(
                     cur,
                     insert_sql,
-                    batched[i : i + DB_BATCH_SIZE],
+                    batched[i: i + DB_BATCH_SIZE],
                     page_size=DB_BATCH_SIZE,
                 )
 
@@ -933,7 +1200,7 @@ class AlpacaDataCollectorOptimized:
         logging.info(f"Processing {len(tickers)} tickers in batches of {BATCH_SIZE}")
 
         for i in range(0, len(tickers), BATCH_SIZE):
-            batch = tickers[i : i + BATCH_SIZE]
+            batch = tickers[i: i + BATCH_SIZE]
             batch_start_time = time.time()
 
             logging.info(
@@ -943,13 +1210,16 @@ class AlpacaDataCollectorOptimized:
             days_back = 40 if not incremental else 1
             daily_bars_batch = self.process_symbol_batch(batch, days_back)
 
+            # Store daily bars (session stats included)
             self.batch_store_daily_bars(daily_bars_batch)
 
+            # Fetch & store 5min candles (used for composite profile)
             data_5min = self.get_market_hours_data_batch(
                 batch, TimeFrame(5, TimeFrameUnit.Minute)
             )
             self.batch_store_data(data_5min, "candles_5min")
 
+            # Fetch & store 15min candles
             data_15min = self.get_market_hours_data_batch(
                 batch, TimeFrame(15, TimeFrameUnit.Minute)
             )
@@ -972,11 +1242,20 @@ class AlpacaDataCollectorOptimized:
         cur = conn.cursor()
 
         try:
-            tables = ["candles_5min", "candles_15min", "daily_bars"]
+            tables = ["candles_5min", "candles_15min", "daily_bars", "composite_session_profiles"]
 
             for table in tables:
                 cur.execute(
                     f"""
+                    SELECT 
+                        COUNT(DISTINCT symbol) AS symbol_count,
+                        COUNT(*) AS total_records,
+                        MIN(session_date) AS earliest,
+                        MAX(session_date) AS latest
+                    FROM {table}
+                    """
+                    if table == "composite_session_profiles"
+                    else f"""
                     SELECT 
                         COUNT(DISTINCT symbol) AS symbol_count,
                         COUNT(*) AS total_records,
