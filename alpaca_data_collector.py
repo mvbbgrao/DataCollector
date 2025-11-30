@@ -9,7 +9,7 @@ from alpaca.data import TimeFrameUnit
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-
+from numba import njit
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, date
@@ -39,12 +39,12 @@ load_dotenv()
 # Postgres DSN: you can also set via env var MARKET_DATA_PG_DSN
 PG_DSN = os.getenv(
     "MARKET_DATA_PG_DSN",
-    "dbname=market user=postgres password=postgres host=localhost port=5432",
+    "dbname=testmarket user=postgres password=postgres host=localhost port=5432",
 )
 
 TICKERS_FILE = "ticker_list.txt"
 SPECIAL_TICKERS_FILE = "special_ticker_list.txt"  # not used currently
-MAX_BARS = 2000
+MAX_BARS = 30000
 
 # Market hours in PST (6:30 AM to 1:00 PM PST)
 MARKET_START_PST = 6.5  # 6:30 AM
@@ -113,6 +113,73 @@ class CompositeSessionProfile:
     lvn_levels: List[float]
     imbalance_score: float
 
+@njit(cache=True)
+def _distribute_volume_exact(lows, highs, volumes, bin_lowers, bin_uppers, price_levels):
+    """
+    Numba-accelerated volume distribution - exact match with original logic.
+
+    Original logic: (price_bins[:-1] <= bar_high) & (price_bins[1:] >= bar_low)
+    """
+    volume_at_price = np.zeros(price_levels, dtype=np.float64)
+
+    for i in range(len(volumes)):
+        if volumes[i] == 0:
+            continue
+
+        bar_low = lows[i]
+        bar_high = highs[i]
+        bar_vol = volumes[i]
+
+        # Count affected bins first (exact same logic as original)
+        count = 0
+        for j in range(price_levels):
+            if bin_lowers[j] <= bar_high and bin_uppers[j] >= bar_low:
+                count += 1
+
+        if count > 0:
+            vol_per_bin = bar_vol / count
+            # Distribute volume to affected bins
+            for j in range(price_levels):
+                if bin_lowers[j] <= bar_high and bin_uppers[j] >= bar_low:
+                    volume_at_price[j] += vol_per_bin
+
+    return volume_at_price
+
+@njit(cache=True)
+def _calculate_value_area(volume_at_price, price_levels):
+    """Numba-accelerated value area calculation."""
+    poc_index = 0
+    max_vol = volume_at_price[0]
+    for i in range(1, price_levels):
+        if volume_at_price[i] > max_vol:
+            max_vol = volume_at_price[i]
+            poc_index = i
+
+    total_volume = volume_at_price.sum()
+    value_area_volume = total_volume * 0.7
+
+    current_volume = volume_at_price[poc_index]
+    low_index = poc_index
+    high_index = poc_index
+
+    while current_volume < value_area_volume:
+        expand_low = low_index > 0
+        expand_high = high_index < price_levels - 1
+
+        if not expand_low and not expand_high:
+            break
+
+        low_vol = volume_at_price[low_index - 1] if expand_low else 0.0
+        high_vol = volume_at_price[high_index + 1] if expand_high else 0.0
+
+        if expand_low and (not expand_high or low_vol >= high_vol):
+            low_index -= 1
+            current_volume += volume_at_price[low_index]
+        elif expand_high:
+            high_index += 1
+            current_volume += volume_at_price[high_index]
+
+    return poc_index, low_index, high_index, total_volume
 
 class AlpacaDataCollectorOptimized:
     def __init__(self, api_key: str, secret_key: str):
@@ -333,7 +400,7 @@ class AlpacaDataCollectorOptimized:
         return df
 
     def calculate_vwap_series(
-        self, df: pd.DataFrame, include_bands: bool = False, multiplier: float = 1.5
+        self, df: pd.DataFrame, include_bands: bool = False, multiplier: float = 1
     ) -> pd.DataFrame:
         """Calculate VWAP for each bar with optional bands - optimized version."""
         if df.empty:
@@ -418,29 +485,78 @@ class AlpacaDataCollectorOptimized:
     # -----------------------------------------------------------------------
     # Session stats & volume profile
     # -----------------------------------------------------------------------
+    def resample_to_daily_bars(self, day_dfs: Dict[date, pd.DataFrame], symbol: str) -> pd.DataFrame:
+        """
+        Resample 1-minute market hours data to daily bars.
 
+        For each day:
+        - Open: first bar's open
+        - High: max of all highs
+        - Low: min of all lows
+        - Close: last bar's close
+        - Volume: sum of all volumes
+        - VWAP: volume-weighted average price
+        """
+        daily_records = []
+
+        for d, day_df in sorted(day_dfs.items()):
+            if day_df.empty:
+                continue
+
+            # Sort by timestamp to ensure correct open/close
+            day_df = day_df.sort_values("timestamp").reset_index(drop=True)
+
+            daily_record = {
+                "symbol": symbol,
+                "timestamp": pd.Timestamp(d),
+                "open": float(day_df["open"].iloc[0]),
+                "high": float(day_df["high"].max()),
+                "low": float(day_df["low"].min()),
+                "close": float(day_df["close"].iloc[-1]),
+                "volume": int(day_df["volume"].sum()),
+            }
+
+            # Calculate VWAP for the day
+            if daily_record["volume"] > 0:
+                typical_price = (day_df["high"] + day_df["low"] + day_df["close"]) / 3
+                daily_record["vwap"] = round(float((typical_price * day_df["volume"]).sum() / daily_record["volume"]), 2)
+            else:
+                daily_record["vwap"] = float(daily_record["close"])
+
+            daily_records.append(daily_record)
+
+        if not daily_records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(daily_records)
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        return df
     def fetch_and_process_session_data(
             self, symbol: str, dates: List[str]
-    ) -> Dict[str, Optional[SessionStats]]:
+    ) -> Tuple[Dict[str, Optional[SessionStats]], pd.DataFrame]:
         """Fetch and process multiple days of session data at once.
 
-        Now also computes and stores composite session profiles (1, 2, 3 days)
+        Now also computes and stores composite session profiles (1, 2, 3, 4 days)
         for each session_date using 1-minute bars.
         """
         if not dates:
             return {}
 
-        # Convert input strings (YYYY-MM-DD) -> datetime
-        dates_dt = [datetime.strptime(d, "%Y-%m-%d") for d in dates]
-        start_date = min(dates_dt)
-        end_date = max(dates_dt) + timedelta(days=1)
-
+        # Convert input strings (YYYY-MM-DD) -> date objects and sort them
+        dates_as_date = sorted([datetime.strptime(d, "%Y-%m-%d").date() for d in dates])
         est = self.est_tz
+
+        # ========== SINGLE API call spanning all dates ==========
+        start_date = dates_as_date[0]
+        end_date = dates_as_date[-1]
+
+        # Fetch from first day 4:00 AM to last day 8:00 PM to capture everything
         session_start = est.localize(
-            datetime.combine(start_date, datetime.min.time()).replace(hour=9, minute=30)
+            datetime.combine(start_date, datetime.min.time()).replace(hour=4, minute=0)
         )
         session_end = est.localize(
-            datetime.combine(end_date, datetime.min.time()).replace(hour=15, minute=59)
+            datetime.combine(end_date, datetime.min.time()).replace(hour=20, minute=0)
         )
 
         request = StockBarsRequest(
@@ -456,186 +572,223 @@ class AlpacaDataCollectorOptimized:
             df = bars.df.reset_index()
 
             if df.empty:
-                return {date_str: None for date_str in dates}
+                return {d.isoformat(): None for d in dates_as_date}
 
             if "timestamp" not in df.columns:
                 logging.error(f"No timestamp column found for {symbol}")
-                return {date_str: None for date_str in dates}
+                return {d.isoformat(): None for d in dates_as_date}
 
             df["timestamp"] = pd.to_datetime(df["timestamp"])
-            df["date"] = df["timestamp"].dt.date
 
-            # VWAP + bands per-day (as before)
-            df = self.calculate_vwap_series(df, include_bands=True)
+            # ========== Filter to market hours only (9:30 AM - 3:59 PM EST) ==========
+            df["timestamp_est"] = df["timestamp"].dt.tz_convert(est)
+            df["time_decimal"] = df["timestamp_est"].dt.hour + df["timestamp_est"].dt.minute / 60.0
+            df = df[(df["time_decimal"] >= 9.5) & (df["time_decimal"] < 16.0)].copy()
+            df = df.drop(columns=["timestamp_est", "time_decimal"])
 
-            results: Dict[str, Optional[SessionStats]] = {}
+            if df.empty:
+                return {d.isoformat(): None for d in dates_as_date}
 
-            # --- NEW: precompute per-day dataframes in date order ---
-            unique_dates = sorted(df["date"].unique())
-            day_dfs: Dict[date, pd.DataFrame] = {
-                d: df[df["date"] == d].copy() for d in unique_dates
-            }
+            df["date"] = df["timestamp"].dt.tz_convert(est).dt.date
 
-            # helper to build & store composite profile for a given lookback
-            def _build_and_store_composite(d_idx: int, lookback_days: int):
-                if lookback_days <= 0:
-                    return
-                if d_idx - lookback_days + 1 < 0:
-                    # not enough prior days yet
-                    return
-
-                # Take N consecutive days ending at unique_dates[d_idx]
-                days_window = unique_dates[d_idx - lookback_days + 1: d_idx + 1]
-                comp_df = pd.concat([day_dfs[d] for d in days_window], ignore_index=True)
-
-                if comp_df.empty:
-                    return
-
-                try:
-                    vp = self.calculate_volume_profile_optimized(comp_df, price_levels=70)
-                    vols = vp.price_levels
-                    if not vols:
-                        return
-
-                    # HVN: top 3 by volume
-                    sorted_by_vol = sorted(vols, key=lambda x: x.volume, reverse=True)
-                    hvn_levels = [round(v.price_level, 2) for v in sorted_by_vol[:3]]
-
-                    # LVN: three lowest non-zero volumes
-                    non_zero = [v for v in vols if v.volume > 0]
-                    sorted_low = sorted(non_zero, key=lambda x: x.volume)
-                    lvn_levels = [round(v.price_level, 2) for v in sorted_low[:3]]
-
-                    highs = comp_df["high"].max()
-                    lows = comp_df["low"].min()
-                    mid_price = (highs + lows) / 2.0
-                    width = max(highs - lows, 1e-6)
-                    asym = abs(vp.poc_price - mid_price) / width
-                    imbalance_score = min(100.0, asym * 200.0)  # 0–100
-
-                    session_date_val = unique_dates[d_idx]
-                    profile = CompositeSessionProfile(
-                        symbol=symbol,
-                        session_date=session_date_val,
-                        lookback_days=lookback_days,
-                        composite_poc=vp.poc_price,
-                        composite_vah=vp.value_area_high,
-                        composite_val=vp.value_area_low,
-                        total_volume=vp.total_volume,
-                        hvn_levels=hvn_levels,
-                        lvn_levels=lvn_levels,
-                        imbalance_score=imbalance_score,
-                    )
-                    self._store_composite_session_profile(profile)
-                except Exception as e:
-                    logging.error(
-                        f"Failed composite profile for {symbol} lb={lookback_days} "
-                        f"on {unique_dates[d_idx]}: {e}"
-                    )
-
-            # --- Main per-day loop (build SessionStats + composites) ---
-            for idx, d in enumerate(unique_dates):
-                date_str = d.isoformat()
-                day_df = day_dfs[d]
-
-                if day_df.empty:
-                    results[date_str] = None
-                    continue
-
-                highest_high = day_df["high"].max()
-                total_volume = day_df["volume"].sum()
-
-                # 1-day profile (same as before, now clearly "lookback 1")
-                try:
-                    volume_profile_metrics = self.calculate_volume_profile_optimized(day_df)
-                    session_high = volume_profile_metrics.value_area_high
-                    session_low = volume_profile_metrics.value_area_low
-                    poc = volume_profile_metrics.poc_price
-                except Exception as e:
-                    logging.warning(
-                        f"Could not calculate volume profile for {symbol} on {date_str}: {e}"
-                    )
-                    session_high = day_df["high"].max()
-                    session_low = day_df["low"].min()
-                    poc = (
-                        day_df.loc[day_df["volume"].idxmax(), "close"]
-                        if not day_df.empty
-                        else None
-                    )
-
-                vwap_upper = (
-                    day_df["vwap_upper"].iloc[-1]
-                    if "vwap_upper" in day_df.columns and len(day_df) > 0
-                    else None
-                )
-                vwap_lower = (
-                    day_df["vwap_lower"].iloc[-1]
-                    if "vwap_lower" in day_df.columns and len(day_df) > 0
-                    else None
-                )
-
-                results[date_str] = SessionStats(
-                    highest_high=highest_high,
-                    session_high=session_high,
-                    session_low=session_low,
-                    poc=poc,
-                    vwap_upper=vwap_upper,
-                    vwap_lower=vwap_lower,
-                    session_volume=total_volume,
-                )
-
-                # --- NEW: store composite profiles for lookbacks 1, 2, 3 ---
-                # 1-day composite (today only) – we can reuse volume_profile_metrics
-                try:
-                    hvn_levels_1 = []
-                    lvn_levels_1 = []
-                    vols_1 = volume_profile_metrics.price_levels if "volume_profile_metrics" in locals() else []
-                    if vols_1:
-                        sorted_by_vol_1 = sorted(vols_1, key=lambda x: x.volume, reverse=True)
-                        hvn_levels_1 = [round(v.price_level, 2) for v in sorted_by_vol_1[:3]]
-
-                        non_zero_1 = [v for v in vols_1 if v.volume > 0]
-                        sorted_low_1 = sorted(non_zero_1, key=lambda x: x.volume)
-                        lvn_levels_1 = [round(v.price_level, 2) for v in sorted_low_1[:3]]
-
-                    highs_1 = day_df["high"].max()
-                    lows_1 = day_df["low"].min()
-                    mid_price_1 = (highs_1 + lows_1) / 2.0
-                    width_1 = max(highs_1 - lows_1, 1e-6)
-                    asym_1 = abs(volume_profile_metrics.poc_price - mid_price_1) / width_1
-                    imbalance_score_1 = min(100.0, asym_1 * 200.0)
-
-                    profile_1 = CompositeSessionProfile(
-                        symbol=symbol,
-                        session_date=d,
-                        lookback_days=1,
-                        composite_poc=volume_profile_metrics.poc_price,
-                        composite_vah=volume_profile_metrics.value_area_high,
-                        composite_val=volume_profile_metrics.value_area_low,
-                        total_volume=volume_profile_metrics.total_volume,
-                        hvn_levels=hvn_levels_1,
-                        lvn_levels=lvn_levels_1,
-                        imbalance_score=imbalance_score_1,
-                    )
-                    self._store_composite_session_profile(profile_1)
-                except Exception as e:
-                    logging.error(f"Failed composite profile (1-day) for {symbol} on {d}: {e}")
-
-                # 2-day & 3-day & 4-day composites
-                _build_and_store_composite(idx, lookback_days=2)
-                _build_and_store_composite(idx, lookback_days=3)
-                _build_and_store_composite(idx, lookback_days=4)
-
-            return results
+            # ========== Split into date -> DataFrame mapping ==========
+            day_dfs: Dict[date, pd.DataFrame] = {}
+            for d in dates_as_date:
+                day_df = df[df["date"] == d].copy()
+                if not day_df.empty:
+                    day_df = self.calculate_vwap_series(day_df, include_bands=True)
+                day_dfs[d] = day_df
 
         except Exception as e:
             logging.error(f"Failed to fetch session data for {symbol}: {e}")
-            return {date_str: None for date_str in dates}
+            return {d.isoformat(): None for d in dates_as_date}
+
+        results: Dict[str, Optional[SessionStats]] = {}
+        profiles_to_store: List[CompositeSessionProfile] = []
+
+        # ========== Helper to build composite profile ==========
+        def _build_composite(date_idx: int, lookback_days: int) -> Optional[CompositeSessionProfile]:
+            """Build composite profile by combining DataFrames based on date index and lookback."""
+            start_idx = date_idx - lookback_days + 1
+            if start_idx < 0:
+                return None
+
+            window_dates = dates_as_date[start_idx:date_idx + 1]
+            dfs_to_combine = [day_dfs[d] for d in window_dates if not day_dfs[d].empty]
+            if not dfs_to_combine:
+                return None
+
+            comp_df = pd.concat(dfs_to_combine, ignore_index=True)
+            if comp_df.empty:
+                return None
+
+            try:
+                vp = self.calculate_volume_profile_optimized(comp_df, price_levels=70)
+                vols = vp.price_levels
+                if not vols:
+                    return None
+
+                sorted_by_vol = sorted(vols, key=lambda x: x.volume, reverse=True)
+                hvn_levels = [round(v.price_level, 2) for v in sorted_by_vol[:3]]
+
+                non_zero = [v for v in vols if v.volume > 0]
+                sorted_low = sorted(non_zero, key=lambda x: x.volume)
+                lvn_levels = [round(v.price_level, 2) for v in sorted_low[:3]]
+
+                highs = comp_df["high"].max()
+                lows = comp_df["low"].min()
+                mid_price = (highs + lows) / 2.0
+                width = max(highs - lows, 1e-6)
+                asym = abs(vp.poc_price - mid_price) / width
+                imbalance_score = min(100.0, asym * 200.0)
+
+                return CompositeSessionProfile(
+                    symbol=symbol,
+                    session_date=dates_as_date[date_idx],
+                    lookback_days=lookback_days,
+                    composite_poc=vp.poc_price,
+                    composite_vah=vp.value_area_high,
+                    composite_val=vp.value_area_low,
+                    total_volume=vp.total_volume,
+                    hvn_levels=hvn_levels,
+                    lvn_levels=lvn_levels,
+                    imbalance_score=imbalance_score,
+                )
+            except Exception as e:
+                logging.error(
+                    f"Failed composite profile for {symbol} lb={lookback_days} "
+                    f"on {dates_as_date[date_idx]}: {e}"
+                )
+                return None
+
+        # ========== Main loop: iterate by index over dates_as_date ==========
+        for idx, d in enumerate(dates_as_date):
+            date_str = d.isoformat()
+            day_df = day_dfs[d]
+
+            if day_df.empty:
+                results[date_str] = None
+                continue
+
+            highest_high = day_df["high"].max()
+            total_volume = day_df["volume"].sum()
+
+            try:
+                volume_profile_metrics = self.calculate_volume_profile_optimized(day_df)
+                session_high = volume_profile_metrics.value_area_high
+                session_low = volume_profile_metrics.value_area_low
+                poc = volume_profile_metrics.poc_price
+            except Exception as e:
+                logging.warning(
+                    f"Could not calculate volume profile for {symbol} on {date_str}: {e}"
+                )
+                session_high = day_df["high"].max()
+                session_low = day_df["low"].min()
+                poc = (
+                    day_df.loc[day_df["volume"].idxmax(), "close"]
+                    if not day_df.empty
+                    else None
+                )
+
+            vwap_upper = (
+                day_df["vwap_upper"].iloc[-1]
+                if "vwap_upper" in day_df.columns and len(day_df) > 0
+                else None
+            )
+            vwap_lower = (
+                day_df["vwap_lower"].iloc[-1]
+                if "vwap_lower" in day_df.columns and len(day_df) > 0
+                else None
+            )
+
+            results[date_str] = SessionStats(
+                highest_high=highest_high,
+                session_high=session_high,
+                session_low=session_low,
+                poc=poc,
+                vwap_upper=vwap_upper,
+                vwap_lower=vwap_lower,
+                session_volume=total_volume,
+            )
+
+            # Build composite profiles for lookbacks 1, 2, 3, 4
+            for lb in [1, 2, 3, 4]:
+                profile = _build_composite(idx, lb)
+                if profile:
+                    profiles_to_store.append(profile)
+
+        # Single batch insert for all profiles
+        if profiles_to_store:
+            self._store_composite_session_profiles_batch(profiles_to_store)
+
+        # ========== Resample to daily bars ==========
+        daily_bars_df = self.resample_to_daily_bars(day_dfs, symbol)
+
+        return results, daily_bars_df
+
+    def _store_composite_session_profiles_batch(self, profiles: List[CompositeSessionProfile]):
+        """Batch insert all composite profiles in ONE transaction."""
+        if not profiles:
+            return
+
+        conn = self._get_pg_conn()
+        cur = conn.cursor()
+
+        try:
+            records = []
+            for p in profiles:
+                records.append((
+                    p.symbol,
+                    p.session_date,
+                    int(p.lookback_days),
+                    float(p.composite_poc) if p.composite_poc is not None else None,
+                    float(p.composite_vah) if p.composite_vah is not None else None,
+                    float(p.composite_val) if p.composite_val is not None else None,
+                    int(p.total_volume) if p.total_volume is not None else None,
+                    json.dumps([float(x) for x in (p.hvn_levels or [])]),
+                    json.dumps([float(x) for x in (p.lvn_levels or [])]),
+                    float(p.imbalance_score) if p.imbalance_score is not None else None,
+                ))
+
+            execute_batch(
+                cur,
+                """
+                INSERT INTO composite_session_profiles
+                (symbol, session_date, lookback_days, composite_poc, composite_vah,
+                 composite_val, total_volume, hvn_levels, lvn_levels, imbalance_score)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (symbol, session_date, lookback_days) DO
+                UPDATE SET
+                    composite_poc = EXCLUDED.composite_poc,
+                    composite_vah = EXCLUDED.composite_vah,
+                    composite_val = EXCLUDED.composite_val,
+                    total_volume = EXCLUDED.total_volume,
+                    hvn_levels = EXCLUDED.hvn_levels,
+                    lvn_levels = EXCLUDED.lvn_levels,
+                    imbalance_score = EXCLUDED.imbalance_score
+                """,
+                records,
+                page_size=1000
+            )
+
+            conn.commit()
+            logging.debug(
+                f"Batch stored {len(profiles)} composite profiles for {profiles[0].symbol if profiles else 'N/A'}")
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error batch storing composite profiles: {e}")
+        finally:
+            cur.close()
+            conn.close()
+
+
 
     def calculate_volume_profile_optimized(
             self, df: pd.DataFrame, price_levels: int = 70
     ) -> VolumeProfileMetrics:
-        """Optimized volume profile calculation using numpy operations."""
+        """
+        Numba-accelerated volume profile calculation - exact match with original logic.
+        """
         if df.empty:
             raise ValueError("DataFrame is empty")
 
@@ -643,13 +796,10 @@ class AlpacaDataCollectorOptimized:
         low_price = df["low"].min()
         price_range = high_price - low_price
 
-        # --- NEW: handle days with no price movement gracefully ---
+        # Handle zero range case
         if price_range == 0:
-            # All trades happened at a single price (or data is synthetic).
-            # Treat this as a degenerate profile with one level.
             total_volume = int(df["volume"].sum())
-            single_price = float(high_price)  # same as low_price
-
+            single_price = float(high_price)
             profile_levels: List[VolumeProfileLevel] = []
             if total_volume > 0:
                 profile_levels.append(
@@ -661,7 +811,6 @@ class AlpacaDataCollectorOptimized:
                         is_value_area=True,
                     )
                 )
-
             return VolumeProfileMetrics(
                 poc_price=round(single_price, 2),
                 value_area_high=round(single_price, 2),
@@ -669,73 +818,46 @@ class AlpacaDataCollectorOptimized:
                 total_volume=total_volume,
                 price_levels=profile_levels,
             )
-        # --- END NEW BLOCK ---
 
+        # Extract numpy arrays
+        lows = df["low"].values.astype(np.float64)
+        highs = df["high"].values.astype(np.float64)
+        volumes = df["volume"].values.astype(np.float64)
+
+        # Build price bins
         price_bins = np.linspace(low_price, high_price, price_levels + 1)
-        volume_at_price = np.zeros(price_levels)
+        bin_lowers = price_bins[:-1].astype(np.float64)
+        bin_uppers = price_bins[1:].astype(np.float64)
 
-        for _, row in df.iterrows():
-            bar_low = row["low"]
-            bar_high = row["high"]
-            bar_volume = row["volume"]
+        # Numba-accelerated volume distribution
+        volume_at_price = _distribute_volume_exact(
+            lows, highs, volumes, bin_lowers, bin_uppers, price_levels
+        )
 
-            if bar_volume == 0:
-                continue
+        # Numba-accelerated value area calculation
+        poc_index, low_index, high_index, total_volume = _calculate_value_area(
+            volume_at_price, price_levels
+        )
 
-            affected_bins = np.where(
-                (price_bins[:-1] <= bar_high) & (price_bins[1:] >= bar_low)
-            )[0]
-
-            if len(affected_bins) > 0:
-                volume_per_bin = bar_volume / len(affected_bins)
-                volume_at_price[affected_bins] += volume_per_bin
-
-        poc_index = int(np.argmax(volume_at_price))
         poc_price = (price_bins[poc_index] + price_bins[poc_index + 1]) / 2
-
-        total_volume = float(volume_at_price.sum())
-        value_area_volume = total_volume * 0.7
-
-        current_volume = float(volume_at_price[poc_index])
-        low_index = high_index = poc_index
-
-        while current_volume < value_area_volume:
-            expand_low = low_index > 0
-            expand_high = high_index < price_levels - 1
-
-            if not expand_low and not expand_high:
-                break
-
-            low_vol = volume_at_price[low_index - 1] if expand_low else 0
-            high_vol = volume_at_price[high_index + 1] if expand_high else 0
-
-            if expand_low and (not expand_high or low_vol >= high_vol):
-                low_index -= 1
-                current_volume += volume_at_price[low_index]
-            elif expand_high:
-                high_index += 1
-                current_volume += volume_at_price[high_index]
-
         value_area_high = (price_bins[high_index] + price_bins[high_index + 1]) / 2
         value_area_low = (price_bins[low_index] + price_bins[low_index + 1]) / 2
 
+        # Build profile levels (this part is fast enough in Python)
+        non_zero_indices = np.where(volume_at_price > 0)[0]
+
         profile_levels: List[VolumeProfileLevel] = []
-        for i in range(price_levels):
-            if volume_at_price[i] > 0:
-                price_level = (price_bins[i] + price_bins[i + 1]) / 2
-                profile_levels.append(
-                    VolumeProfileLevel(
-                        price_level=float(price_level),
-                        volume=int(volume_at_price[i]),
-                        percentage=(
-                            (float(volume_at_price[i]) / total_volume) * 100
-                            if total_volume > 0
-                            else 0
-                        ),
-                        is_poc=(i == poc_index),
-                        is_value_area=(low_index <= i <= high_index),
-                    )
+        for i in non_zero_indices:
+            price_level = (price_bins[i] + price_bins[i + 1]) / 2
+            profile_levels.append(
+                VolumeProfileLevel(
+                    price_level=float(price_level),
+                    volume=int(volume_at_price[i]),
+                    percentage=(float(volume_at_price[i]) / total_volume * 100) if total_volume > 0 else 0,
+                    is_poc=(i == poc_index),
+                    is_value_area=(low_index <= i <= high_index),
                 )
+            )
 
         return VolumeProfileMetrics(
             poc_price=round(float(poc_price), 2),
@@ -837,7 +959,7 @@ class AlpacaDataCollectorOptimized:
     # Symbol processing / indicators
     # -----------------------------------------------------------------------
 
-    def process_symbol_batch(self, symbols: List[str], days_back: int = 40) -> Dict[str, List[dict]]:
+    def process_symbol_batch(self, symbols: List[str], days_back: int = 180) -> Dict[str, List[dict]]:
         """Process a batch of symbols in parallel."""
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days_back)
@@ -884,13 +1006,18 @@ class AlpacaDataCollectorOptimized:
 
             df["timestamp"] = pd.to_datetime(df["timestamp"])
             df = df.sort_values("timestamp").reset_index(drop=True)
-            df = self.calculate_daily_indicators_optimized(df)
 
             dates_to_fetch = [row["timestamp"].date().isoformat() for _, row in df.iterrows()]
-            session_stats = self.fetch_and_process_session_data(symbol, dates_to_fetch)
+            session_stats, daily_df   = self.fetch_and_process_session_data(symbol, dates_to_fetch)
+
+            if daily_df.empty:
+                return []
+
+                # Calculate daily indicators on resampled data
+            daily_df = self.calculate_daily_indicators_optimized(daily_df)
 
             result: List[dict] = []
-            for _, row in df.iterrows():
+            for _, row in daily_df.iterrows():
                 date_str = row["timestamp"].date().isoformat()
                 stats = session_stats.get(date_str)
 
@@ -948,7 +1075,7 @@ class AlpacaDataCollectorOptimized:
     # -----------------------------------------------------------------------
 
     def get_market_hours_data_batch(
-        self, symbols: List[str], timeframe: TimeFrame, days_back: int = 30
+        self, symbols: List[str], timeframe: TimeFrame, days_back: int = 180
     ) -> Dict[str, pd.DataFrame]:
         """Fetch market hours data for multiple symbols in parallel."""
         results: Dict[str, pd.DataFrame] = {}
@@ -1207,7 +1334,7 @@ class AlpacaDataCollectorOptimized:
                 f"Processing batch {i // BATCH_SIZE + 1}/{(len(tickers) - 1) // BATCH_SIZE + 1}: {batch}"
             )
 
-            days_back = 40 if not incremental else 1
+            days_back = 180 if not incremental else 1
             daily_bars_batch = self.process_symbol_batch(batch, days_back)
 
             # Store daily bars (session stats included)
