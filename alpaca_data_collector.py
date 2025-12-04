@@ -279,6 +279,8 @@ class AlpacaDataCollectorOptimized:
                     atr          DOUBLE PRECISION,
                     rsi_10       DOUBLE PRECISION,
                     momentum_10  DOUBLE PRECISION,
+                    ema_8        DOUBLE PRECISION,
+                    ema_20       DOUBLE PRECISION,
                     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (symbol, timestamp)
                 );
@@ -1042,6 +1044,8 @@ class AlpacaDataCollectorOptimized:
                     "atr": float(row.get("atr")) if pd.notna(row.get("atr")) else None,
                     "rsi_10": float(row.get("rsi_10")) if pd.notna(row.get("rsi_10")) else None,
                     "momentum_10": float(row.get("momentum_10")) if pd.notna(row.get("momentum_10")) else None,
+                    "ema_8": float(row.get("ema_8")) if pd.notna(row.get("ema_8")) else None,
+                    "ema_20": float(row.get("ema_20")) if pd.notna(row.get("ema_20")) else None,
                 }
                 result.append(bar_data)
 
@@ -1065,6 +1069,7 @@ class AlpacaDataCollectorOptimized:
 
         df = self.calculate_rsi(df, period=10)
         df = self.calculate_momentum(df, period=10)
+        df = self.calculate_ema_series(df, [8, 20])
 
         df = df.drop(["high_low", "high_pc", "low_pc", "true_range"], axis=1, errors="ignore")
 
@@ -1075,7 +1080,7 @@ class AlpacaDataCollectorOptimized:
     # -----------------------------------------------------------------------
 
     def get_market_hours_data_batch(
-        self, symbols: List[str], timeframe: TimeFrame, days_back: int = 180
+        self, symbols: List[str], timeframe: TimeFrame, days_back: int = 360
     ) -> Dict[str, pd.DataFrame]:
         """Fetch market hours data for multiple symbols in parallel."""
         results: Dict[str, pd.DataFrame] = {}
@@ -1256,6 +1261,8 @@ class AlpacaDataCollectorOptimized:
                 "atr",
                 "rsi_10",
                 "momentum_10",
+                "ema_8",
+                "ema_20",
             ]
             col_list = ",".join(columns)
             placeholders = ",".join(["%s"] * len(columns))
@@ -1286,6 +1293,8 @@ class AlpacaDataCollectorOptimized:
                     bar.get("atr"),
                     bar.get("rsi_10"),
                     bar.get("momentum_10"),
+                    bar.get("ema_8"),
+                    bar.get("ema_20"),
                 ]
                 for bar in all_records
             ]
@@ -1334,7 +1343,7 @@ class AlpacaDataCollectorOptimized:
                 f"Processing batch {i // BATCH_SIZE + 1}/{(len(tickers) - 1) // BATCH_SIZE + 1}: {batch}"
             )
 
-            days_back = 180 if not incremental else 1
+            days_back = 360 if not incremental else 1
             daily_bars_batch = self.process_symbol_batch(batch, days_back)
 
             # Store daily bars (session stats included)
