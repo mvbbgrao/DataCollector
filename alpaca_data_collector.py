@@ -42,7 +42,7 @@ PG_DSN = os.getenv(
     "dbname=testmarket user=postgres password=postgres host=localhost port=5432",
 )
 
-TICKERS_FILE = "ticker_list.txt"
+TICKERS_FILE = "special_ticker_list.txt"#"ticker_list.txt"
 SPECIAL_TICKERS_FILE = "special_ticker_list.txt"  # not used currently
 MAX_BARS = 30000
 
@@ -281,6 +281,7 @@ class AlpacaDataCollectorOptimized:
                     momentum_10  DOUBLE PRECISION,
                     ema_8        DOUBLE PRECISION,
                     ema_20       DOUBLE PRECISION,
+                    ema_39_of_15min    DOUBLE PRECISION,   -- NEW
                     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (symbol, timestamp)
                 );
@@ -318,6 +319,7 @@ class AlpacaDataCollectorOptimized:
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_daily_symbol_timestamp ON daily_bars(symbol, timestamp);"
             )
+
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_csp_symbol_date ON composite_session_profiles(symbol, session_date);"
             )
@@ -1263,6 +1265,7 @@ class AlpacaDataCollectorOptimized:
                 "momentum_10",
                 "ema_8",
                 "ema_20",
+                "ema_39_of_15min",
             ]
             col_list = ",".join(columns)
             placeholders = ",".join(["%s"] * len(columns))
@@ -1295,6 +1298,7 @@ class AlpacaDataCollectorOptimized:
                     bar.get("momentum_10"),
                     bar.get("ema_8"),
                     bar.get("ema_20"),
+                    bar.get("ema_39_of_15min"),
                 ]
                 for bar in all_records
             ]
@@ -1313,6 +1317,55 @@ class AlpacaDataCollectorOptimized:
         except Exception as e:
             logging.error(f"Error storing daily bars: {e}")
             conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
+
+    def update_daily_bars_with_ema39_of_15min(self, symbols: List[str]):
+        """
+        For each symbol/date, set daily_bars.ema_39_of_15min to the last
+        15-minute ema_39 value of that day from candles_15min.
+        """
+        if not symbols:
+            return
+
+        conn = self._get_pg_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                WITH last_ema AS (
+                    SELECT DISTINCT ON (symbol, trade_date)
+                        symbol,
+                        trade_date,
+                        ema_39
+                    FROM (
+                        SELECT
+                            symbol,
+                            timestamp::date AS trade_date,
+                            ema_39,
+                            timestamp
+                        FROM candles_15min
+                        WHERE symbol = ANY(%s)
+                          AND ema_39 IS NOT NULL
+                    ) t
+                    ORDER BY symbol, trade_date, timestamp DESC
+                )
+                UPDATE daily_bars d
+                SET ema_39_of_15min = l.ema_39
+                FROM last_ema l
+                WHERE d.symbol = l.symbol
+                  AND d.timestamp = l.trade_date;
+                """,
+                (symbols,),
+            )
+            conn.commit()
+            logging.info(
+                f"Updated ema_39_of_15min in daily_bars for {len(symbols)} symbols"
+            )
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error updating ema_39_of_15min: {e}")
         finally:
             cur.close()
             conn.close()
@@ -1360,6 +1413,9 @@ class AlpacaDataCollectorOptimized:
                 batch, TimeFrame(15, TimeFrameUnit.Minute)
             )
             self.batch_store_data(data_15min, "candles_15min")
+
+            # Now that candles_15min are in DB, backfill daily_bars.ema_39_of_15min
+            self.update_daily_bars_with_ema39_of_15min(batch)
 
             batch_time = time.time() - batch_start_time
             logging.info(f"Batch completed in {batch_time:.2f} seconds")
