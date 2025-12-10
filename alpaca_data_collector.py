@@ -42,7 +42,7 @@ PG_DSN = os.getenv(
     "dbname=testmarket user=postgres password=postgres host=localhost port=5432",
 )
 
-TICKERS_FILE = "special_ticker_list.txt"#"ticker_list.txt"
+TICKERS_FILE = "temp_ticker_list.txt" #"ticker_list.txt"
 SPECIAL_TICKERS_FILE = "special_ticker_list.txt"  # not used currently
 MAX_BARS = 30000
 
@@ -103,8 +103,8 @@ class SessionStats:
 class CompositeSessionProfile:
     """Composite session profile across multiple days"""
     symbol: str
-    session_date: date        # as-of date (last day in the window)
-    lookback_days: int        # e.g. 2 or 3
+    session_date: date  # as-of date (last day in the window)
+    lookback_days: int  # e.g. 2 or 3
     composite_poc: float
     composite_vah: float
     composite_val: float
@@ -112,6 +112,7 @@ class CompositeSessionProfile:
     hvn_levels: List[float]
     lvn_levels: List[float]
     imbalance_score: float
+
 
 @njit(cache=True)
 def _distribute_volume_exact(lows, highs, volumes, bin_lowers, bin_uppers, price_levels):
@@ -144,6 +145,7 @@ def _distribute_volume_exact(lows, highs, volumes, bin_lowers, bin_uppers, price
                     volume_at_price[j] += vol_per_bin
 
     return volume_at_price
+
 
 @njit(cache=True)
 def _calculate_value_area(volume_at_price, price_levels):
@@ -180,6 +182,7 @@ def _calculate_value_area(volume_at_price, price_levels):
             current_volume += volume_at_price[high_index]
 
     return poc_index, low_index, high_index, total_volume
+
 
 class AlpacaDataCollectorOptimized:
     def __init__(self, api_key: str, secret_key: str):
@@ -404,7 +407,7 @@ class AlpacaDataCollectorOptimized:
         return df
 
     def calculate_vwap_series(
-        self, df: pd.DataFrame, include_bands: bool = False, multiplier: float = 1
+            self, df: pd.DataFrame, include_bands: bool = False, multiplier: float = 1
     ) -> pd.DataFrame:
         """Calculate VWAP for each bar with optional bands - optimized version."""
         if df.empty:
@@ -536,13 +539,20 @@ class AlpacaDataCollectorOptimized:
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         return df
+
     def fetch_and_process_session_data(
             self, symbol: str, dates: List[str]
     ) -> Tuple[Dict[str, Optional[SessionStats]], pd.DataFrame]:
         """Fetch and process multiple days of session data at once.
 
-        Now also computes and stores composite session profiles (1, 2, 3, 4 days)
+        Now also computes and stores composite session profiles (2, 3, 4 days)
         for each session_date using 1-minute bars.
+
+        IMPORTANT: Composite profiles EXCLUDE the current day.
+        For example, for session_date 12/05/2025:
+          - 2-day profile uses data from [12/03, 12/04]
+          - 3-day profile uses data from [12/02, 12/03, 12/04]
+          - 4-day profile uses data from [12/01, 12/02, 12/03, 12/04]
         """
         if not dates:
             return {}
@@ -612,12 +622,20 @@ class AlpacaDataCollectorOptimized:
 
         # ========== Helper to build composite profile ==========
         def _build_composite(date_idx: int, lookback_days: int) -> Optional[CompositeSessionProfile]:
-            """Build composite profile by combining DataFrames based on date index and lookback."""
-            start_idx = date_idx - lookback_days + 1
+            """Build composite profile by combining DataFrames based on date index and lookback.
+
+            IMPORTANT: Excludes the current day (date_idx) and uses the previous N days.
+            For example, if date_idx points to 12/05 and lookback_days=2:
+              - Uses data from [12/03, 12/04] (excludes 12/05)
+              - Stores session_date as 12/05 (the "as-of" date)
+            """
+            # Exclude current day: use dates from (date_idx - lookback_days) to (date_idx - 1)
+            end_idx = date_idx  # exclusive - current day not included
+            start_idx = date_idx - lookback_days
             if start_idx < 0:
                 return None
 
-            window_dates = dates_as_date[start_idx:date_idx + 1]
+            window_dates = dates_as_date[start_idx:end_idx]  # excludes date_idx
             dfs_to_combine = [day_dfs[d] for d in window_dates if not day_dfs[d].empty]
             if not dfs_to_combine:
                 return None
@@ -648,7 +666,7 @@ class AlpacaDataCollectorOptimized:
 
                 return CompositeSessionProfile(
                     symbol=symbol,
-                    session_date=dates_as_date[date_idx],
+                    session_date=dates_as_date[date_idx],  # Store as-of date (current day)
                     lookback_days=lookback_days,
                     composite_poc=vp.poc_price,
                     composite_vah=vp.value_area_high,
@@ -715,8 +733,9 @@ class AlpacaDataCollectorOptimized:
                 session_volume=total_volume,
             )
 
-            # Build composite profiles for lookbacks 1, 2, 3, 4
-            for lb in [1, 2, 3, 4]:
+            # Build composite profiles for lookbacks 2, 3, 4 (excluding current day)
+            # Note: lookback=1 would be redundant since it's just yesterday's single-day profile
+            for lb in [2, 3, 4]:
                 profile = _build_composite(idx, lb)
                 if profile:
                     profiles_to_store.append(profile)
@@ -784,8 +803,6 @@ class AlpacaDataCollectorOptimized:
         finally:
             cur.close()
             conn.close()
-
-
 
     def calculate_volume_profile_optimized(
             self, df: pd.DataFrame, price_levels: int = 70
@@ -876,7 +893,7 @@ class AlpacaDataCollectorOptimized:
     # -----------------------------------------------------------------------
 
     def calculate_composite_profile_from_candles(
-        self, df: pd.DataFrame, price_levels: int = 70
+            self, df: pd.DataFrame, price_levels: int = 70
     ) -> VolumeProfileMetrics:
         """
         Build a multi-day composite volume profile using the existing
@@ -989,7 +1006,7 @@ class AlpacaDataCollectorOptimized:
         return all_results
 
     def process_single_symbol(
-        self, symbol: str, start_date: datetime, end_date: datetime
+            self, symbol: str, start_date: datetime, end_date: datetime
     ) -> List[dict]:
         """Process a single symbol - fetch daily bars and session stats."""
         try:
@@ -1012,7 +1029,7 @@ class AlpacaDataCollectorOptimized:
             df = df.sort_values("timestamp").reset_index(drop=True)
 
             dates_to_fetch = [row["timestamp"].date().isoformat() for _, row in df.iterrows()]
-            session_stats, daily_df   = self.fetch_and_process_session_data(symbol, dates_to_fetch)
+            session_stats, daily_df = self.fetch_and_process_session_data(symbol, dates_to_fetch)
 
             if daily_df.empty:
                 return []
@@ -1082,7 +1099,7 @@ class AlpacaDataCollectorOptimized:
     # -----------------------------------------------------------------------
 
     def get_market_hours_data_batch(
-        self, symbols: List[str], timeframe: TimeFrame, days_back: int = 360
+            self, symbols: List[str], timeframe: TimeFrame, days_back: int = 360
     ) -> Dict[str, pd.DataFrame]:
         """Fetch market hours data for multiple symbols in parallel."""
         results: Dict[str, pd.DataFrame] = {}
@@ -1107,7 +1124,7 @@ class AlpacaDataCollectorOptimized:
         return results
 
     def get_market_hours_data_single(
-        self, symbol: str, timeframe: TimeFrame, days_back: int = 10
+            self, symbol: str, timeframe: TimeFrame, days_back: int = 10
     ) -> pd.DataFrame:
         """Fetch market hours data for a single symbol."""
         end_date = datetime.now(self.est_tz)
@@ -1334,26 +1351,22 @@ class AlpacaDataCollectorOptimized:
         try:
             cur.execute(
                 """
-                WITH last_ema AS (
-                    SELECT DISTINCT ON (symbol, trade_date)
-                        symbol,
-                        trade_date,
-                        ema_39
-                    FROM (
-                        SELECT
-                            symbol,
-                            timestamp::date AS trade_date,
-                            ema_39,
-                            timestamp
-                        FROM candles_15min
-                        WHERE symbol = ANY(%s)
-                          AND ema_39 IS NOT NULL
+                WITH last_ema AS (SELECT DISTINCT
+                ON (symbol, trade_date)
+                    symbol,
+                    trade_date,
+                    ema_39
+                FROM (
+                    SELECT
+                    symbol, timestamp :: date AS trade_date, ema_39, timestamp
+                    FROM candles_15min
+                    WHERE symbol = ANY (%s)
+                    AND ema_39 IS NOT NULL
                     ) t
-                    ORDER BY symbol, trade_date, timestamp DESC
-                )
+                ORDER BY symbol, trade_date, timestamp DESC
+                    )
                 UPDATE daily_bars d
-                SET ema_39_of_15min = l.ema_39
-                FROM last_ema l
+                SET ema_39_of_15min = l.ema_39 FROM last_ema l
                 WHERE d.symbol = l.symbol
                   AND d.timestamp = l.trade_date;
                 """,
@@ -1489,7 +1502,7 @@ def main():
 
         total_time = time.time() - start_time
         print(
-            f"\n✅ Total execution time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)"
+            f"\n✅ Total execution time: {total_time:.2f} seconds ({total_time / 60:.2f} minutes)"
         )
 
     except Exception as e:
