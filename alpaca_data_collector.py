@@ -42,7 +42,7 @@ PG_DSN = os.getenv(
     "dbname=testmarket user=postgres password=postgres host=localhost port=5432",
 )
 
-TICKERS_FILE = "temp_ticker_list.txt" #"ticker_list.txt"
+TICKERS_FILE = "ticker_list.txt"
 SPECIAL_TICKERS_FILE = "special_ticker_list.txt"  # not used currently
 MAX_BARS = 30000
 
@@ -150,6 +150,7 @@ def _distribute_volume_exact(lows, highs, volumes, bin_lowers, bin_uppers, price
 @njit(cache=True)
 def _calculate_value_area(volume_at_price, price_levels):
     """Numba-accelerated value area calculation."""
+    # Find POC (highest volume level)
     poc_index = 0
     max_vol = volume_at_price[0]
     for i in range(1, price_levels):
@@ -158,12 +159,13 @@ def _calculate_value_area(volume_at_price, price_levels):
             poc_index = i
 
     total_volume = volume_at_price.sum()
-    value_area_volume = total_volume * 0.7
+    value_area_volume = total_volume * 0.68  # 70% of volume
 
     current_volume = volume_at_price[poc_index]
     low_index = poc_index
     high_index = poc_index
 
+    # Expand from POC until we capture 70% of volume
     while current_volume < value_area_volume:
         expand_low = low_index > 0
         expand_high = high_index < price_levels - 1
@@ -174,12 +176,13 @@ def _calculate_value_area(volume_at_price, price_levels):
         low_vol = volume_at_price[low_index - 1] if expand_low else 0.0
         high_vol = volume_at_price[high_index + 1] if expand_high else 0.0
 
-        if expand_low and (not expand_high or low_vol >= high_vol):
-            low_index -= 1
-            current_volume += volume_at_price[low_index]
-        elif expand_high:
+        # FIXED: On tie, expand HIGH first (matches TradingView convention)
+        if expand_high and (not expand_low or high_vol >= low_vol):
             high_index += 1
             current_volume += volume_at_price[high_index]
+        elif expand_low:
+            low_index -= 1
+            current_volume += volume_at_price[low_index]
 
     return poc_index, low_index, high_index, total_volume
 
