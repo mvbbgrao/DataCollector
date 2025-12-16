@@ -3,6 +3,29 @@
 Alpaca Candlestick Data Collector - Ultra Optimized Version
 Fetches 5min and 15min candlestick data and stores in PostgreSQL database.
 Optimized for processing large numbers of symbols quickly using parallel processing and batch operations.
+
+RVOL Implementation (15-minute candles):
+- slot_index: 0-25 mapping to 15-minute slots from 09:30-16:00 ET
+- cum_volume: cumulative volume within session
+
+Slot RVOL:
+- rvol_slot_20: current slot volume / baseline (median of same slot over prior 20 sessions)
+- rvol_slot_baseline_20: the baseline value used
+
+Cumulative RVOL:
+- rvol_cum_20: current cumulative volume / baseline cumulative at same slot
+- rvol_cum_baseline_20: the baseline value used
+
+Intraday RVOL (projected EOD):
+- intraday_rvol_20: projected EOD volume / average daily volume
+- avg_daily_volume_20: average full-day volume over prior 20 sessions
+- pct_of_day_typical: typical % of daily volume completed by this slot
+
+All baselines use MEDIAN (not mean) to reduce sensitivity to earnings/news spikes.
+Baselines exclude current session (shift by 1).
+
+NOTE: All timestamps are stored in UTC format. Slot index calculations are done
+      internally using ET conversion but timestamps remain in UTC.
 """
 
 from alpaca.data import TimeFrameUnit
@@ -23,7 +46,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from queue import Queue
 import time
-from functools import lru_cache
 
 import psycopg2
 from psycopg2.extras import execute_batch
@@ -36,7 +58,6 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Postgres DSN: you can also set via env var MARKET_DATA_PG_DSN
 PG_DSN = os.getenv(
     "MARKET_DATA_PG_DSN",
     "dbname=testmarket user=postgres password=postgres host=localhost port=5432",
@@ -46,15 +67,19 @@ TICKERS_FILE = "ticker_list.txt"
 SPECIAL_TICKERS_FILE = "special_ticker_list.txt"  # not used currently
 MAX_BARS = 30000
 
-# Market hours in PST (6:30 AM to 1:00 PM PST)
-MARKET_START_PST = 6.5  # 6:30 AM
-MARKET_END_PST = 12.99  # 1:00 PM
+# Market hours in PST (6:30 AM to 1:00 PM PST = 9:30 AM to 4:00 PM ET)
+MARKET_START_PST = 6.5  # 6:30 AM PST
+MARKET_END_PST = 12.99  # 1:00 PM PST
 
 # Optimization parameters
-MAX_WORKERS = 20  # Number of parallel threads for API calls
-BATCH_SIZE = 10  # Number of symbols to process in each batch
-DB_BATCH_SIZE = 100  # Number of records to insert in each database batch
-CACHE_SIZE = 1000  # Size of LRU cache for frequently accessed data
+MAX_WORKERS = 20
+BATCH_SIZE = 10
+DB_BATCH_SIZE = 100
+
+# RVOL configuration
+RVOL_LOOKBACK_SESSIONS = 20
+RVOL_MIN_SESSIONS = 5  # require at least 5 sessions for valid baseline
+RVOL_MIN_BASELINE_VOLUME = 100  # minimum baseline volume to compute RVOL (absolute floor)
 
 # Set up logging
 logging.basicConfig(
@@ -73,16 +98,16 @@ class VolumeProfileLevel:
     price_level: float
     volume: int
     percentage: float
-    is_poc: bool = False  # Point of Control
+    is_poc: bool = False
     is_value_area: bool = False
 
 
 @dataclass
 class VolumeProfileMetrics:
     """Data class for volume profile metrics"""
-    poc_price: float  # Point of Control
-    value_area_high: float  # Value Area High
-    value_area_low: float  # Value Area Low
+    poc_price: float
+    value_area_high: float
+    value_area_low: float
     total_volume: int
     price_levels: List[VolumeProfileLevel]
 
@@ -103,8 +128,8 @@ class SessionStats:
 class CompositeSessionProfile:
     """Composite session profile across multiple days"""
     symbol: str
-    session_date: date  # as-of date (last day in the window)
-    lookback_days: int  # e.g. 2 or 3
+    session_date: date
+    lookback_days: int
     composite_poc: float
     composite_vah: float
     composite_val: float
@@ -116,11 +141,7 @@ class CompositeSessionProfile:
 
 @njit(cache=True)
 def _distribute_volume_exact(lows, highs, volumes, bin_lowers, bin_uppers, price_levels):
-    """
-    Numba-accelerated volume distribution - exact match with original logic.
-
-    Original logic: (price_bins[:-1] <= bar_high) & (price_bins[1:] >= bar_low)
-    """
+    """Numba-accelerated volume distribution."""
     volume_at_price = np.zeros(price_levels, dtype=np.float64)
 
     for i in range(len(volumes)):
@@ -131,7 +152,6 @@ def _distribute_volume_exact(lows, highs, volumes, bin_lowers, bin_uppers, price
         bar_high = highs[i]
         bar_vol = volumes[i]
 
-        # Count affected bins first (exact same logic as original)
         count = 0
         for j in range(price_levels):
             if bin_lowers[j] <= bar_high and bin_uppers[j] >= bar_low:
@@ -139,7 +159,6 @@ def _distribute_volume_exact(lows, highs, volumes, bin_lowers, bin_uppers, price
 
         if count > 0:
             vol_per_bin = bar_vol / count
-            # Distribute volume to affected bins
             for j in range(price_levels):
                 if bin_lowers[j] <= bar_high and bin_uppers[j] >= bar_low:
                     volume_at_price[j] += vol_per_bin
@@ -150,7 +169,6 @@ def _distribute_volume_exact(lows, highs, volumes, bin_lowers, bin_uppers, price
 @njit(cache=True)
 def _calculate_value_area(volume_at_price, price_levels):
     """Numba-accelerated value area calculation."""
-    # Find POC (highest volume level)
     poc_index = 0
     max_vol = volume_at_price[0]
     for i in range(1, price_levels):
@@ -159,13 +177,12 @@ def _calculate_value_area(volume_at_price, price_levels):
             poc_index = i
 
     total_volume = volume_at_price.sum()
-    value_area_volume = total_volume * 0.68  # 70% of volume
+    value_area_volume = total_volume * 0.70
 
     current_volume = volume_at_price[poc_index]
     low_index = poc_index
     high_index = poc_index
 
-    # Expand from POC until we capture 70% of volume
     while current_volume < value_area_volume:
         expand_low = low_index > 0
         expand_high = high_index < price_levels - 1
@@ -176,7 +193,6 @@ def _calculate_value_area(volume_at_price, price_levels):
         low_vol = volume_at_price[low_index - 1] if expand_low else 0.0
         high_vol = volume_at_price[high_index + 1] if expand_high else 0.0
 
-        # FIXED: On tie, expand HIGH first (matches TradingView convention)
         if expand_high and (not expand_low or high_vol >= low_vol):
             high_index += 1
             current_volume += volume_at_price[high_index]
@@ -189,20 +205,13 @@ def _calculate_value_area(volume_at_price, price_levels):
 
 class AlpacaDataCollectorOptimized:
     def __init__(self, api_key: str, secret_key: str):
-        """Initialize the Alpaca data collector with optimization features."""
+        """Initialize the Alpaca data collector."""
         self.client = StockHistoricalDataClient(api_key, secret_key)
         self.pst_tz = pytz.timezone('US/Pacific')
-        self.est_tz = pytz.timezone('US/Eastern')  # Alpaca uses EST
+        self.est_tz = pytz.timezone('US/Eastern')
+        self.utc_tz = pytz.UTC
 
-        # Thread-safe database connection pool
         self.db_lock = threading.Lock()
-        self.db_queue = Queue()
-
-        # Cache for frequently accessed data
-        self.session_cache = {}
-        self.daily_bars_cache = {}
-
-        # Performance tracking
         self.api_call_count = 0
         self.start_time = None
 
@@ -221,114 +230,325 @@ class AlpacaDataCollectorOptimized:
 
         try:
             # candles_5min
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS candles_5min (
-                    id          SERIAL PRIMARY KEY,
-                    symbol      TEXT NOT NULL,
-                    timestamp   TIMESTAMP NOT NULL,
-                    open        DOUBLE PRECISION NOT NULL,
-                    high        DOUBLE PRECISION NOT NULL,
-                    low         DOUBLE PRECISION NOT NULL,
-                    close       DOUBLE PRECISION NOT NULL,
-                    volume      BIGINT NOT NULL,
-                    vwap        DOUBLE PRECISION,
-                    ema_8       DOUBLE PRECISION,
-                    ema_20      DOUBLE PRECISION,
-                    ema_39      DOUBLE PRECISION,
-                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE (symbol, timestamp)
-                );
-                """
-            )
+            cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candles_5min
+                        (
+                            id
+                            SERIAL
+                            PRIMARY
+                            KEY,
+                            symbol
+                            TEXT
+                            NOT
+                            NULL,
+                            timestamp
+                            TIMESTAMP
+                            NOT
+                            NULL,
+                            open
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            high
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            low
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            close
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            volume
+                            BIGINT
+                            NOT
+                            NULL,
+                            vwap
+                            DOUBLE
+                            PRECISION,
+                            ema_8
+                            DOUBLE
+                            PRECISION,
+                            ema_20
+                            DOUBLE
+                            PRECISION,
+                            ema_39
+                            DOUBLE
+                            PRECISION,
+                            created_at
+                            TIMESTAMP
+                            DEFAULT
+                            CURRENT_TIMESTAMP,
+                            UNIQUE
+                        (
+                            symbol,
+                            timestamp
+                        )
+                            );
+                        """)
 
-            # candles_15min
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS candles_15min (
-                    id          SERIAL PRIMARY KEY,
-                    symbol      TEXT NOT NULL,
-                    timestamp   TIMESTAMP NOT NULL,
-                    open        DOUBLE PRECISION NOT NULL,
-                    high        DOUBLE PRECISION NOT NULL,
-                    low         DOUBLE PRECISION NOT NULL,
-                    close       DOUBLE PRECISION NOT NULL,
-                    volume      BIGINT NOT NULL,
-                    vwap        DOUBLE PRECISION,
-                    ema_8       DOUBLE PRECISION,
-                    ema_20      DOUBLE PRECISION,
-                    ema_39      DOUBLE PRECISION,
-                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE (symbol, timestamp)
-                );
-                """
-            )
+            # candles_15min with RVOL fields
+            cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candles_15min
+                        (
+                            id
+                            SERIAL
+                            PRIMARY
+                            KEY,
+                            symbol
+                            TEXT
+                            NOT
+                            NULL,
+                            timestamp
+                            TIMESTAMP
+                            NOT
+                            NULL,
+                            open
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            high
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            low
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            close
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            volume
+                            BIGINT
+                            NOT
+                            NULL,
+                            vwap
+                            DOUBLE
+                            PRECISION,
+                            ema_8
+                            DOUBLE
+                            PRECISION,
+                            ema_20
+                            DOUBLE
+                            PRECISION,
+                            ema_39
+                            DOUBLE
+                            PRECISION,
+
+                            -- Slot RVOL
+                            slot_index
+                            SMALLINT,
+                            cum_volume
+                            BIGINT,
+                            rvol_slot_20
+                            DOUBLE
+                            PRECISION,
+                            rvol_slot_baseline_20
+                            DOUBLE
+                            PRECISION,
+
+                            -- Cumulative RVOL
+                            rvol_cum_20
+                            DOUBLE
+                            PRECISION,
+                            rvol_cum_baseline_20
+                            DOUBLE
+                            PRECISION,
+
+                            -- Intraday RVOL (projected EOD)
+                            intraday_rvol_20
+                            DOUBLE
+                            PRECISION,
+                            avg_daily_volume_20
+                            DOUBLE
+                            PRECISION,
+                            pct_of_day_typical
+                            DOUBLE
+                            PRECISION,
+
+                            created_at
+                            TIMESTAMP
+                            DEFAULT
+                            CURRENT_TIMESTAMP,
+                            UNIQUE
+                        (
+                            symbol,
+                            timestamp
+                        )
+                            );
+                        """)
+
+            # Add columns if table already exists
+            new_columns = [
+                ("slot_index", "SMALLINT"),
+                ("cum_volume", "BIGINT"),
+                ("rvol_slot_20", "DOUBLE PRECISION"),
+                ("rvol_slot_baseline_20", "DOUBLE PRECISION"),
+                ("rvol_cum_20", "DOUBLE PRECISION"),
+                ("rvol_cum_baseline_20", "DOUBLE PRECISION"),
+                ("intraday_rvol_20", "DOUBLE PRECISION"),
+                ("avg_daily_volume_20", "DOUBLE PRECISION"),
+                ("pct_of_day_typical", "DOUBLE PRECISION"),
+            ]
+            for col_name, col_type in new_columns:
+                cur.execute(f"ALTER TABLE candles_15min ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
 
             # daily_bars
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS daily_bars (
-                    id           SERIAL PRIMARY KEY,
-                    symbol       TEXT NOT NULL,
-                    timestamp    DATE NOT NULL,
-                    open         DOUBLE PRECISION NOT NULL,
-                    high         DOUBLE PRECISION NOT NULL,
-                    low          DOUBLE PRECISION NOT NULL,
-                    close        DOUBLE PRECISION NOT NULL,
-                    volume       BIGINT NOT NULL,
-                    vwap         DOUBLE PRECISION,
-                    vwap_upper   DOUBLE PRECISION,
-                    vwap_lower   DOUBLE PRECISION,
-                    session_high DOUBLE PRECISION,
-                    session_low  DOUBLE PRECISION,
-                    poc          DOUBLE PRECISION,
-                    atr          DOUBLE PRECISION,
-                    rsi_10       DOUBLE PRECISION,
-                    momentum_10  DOUBLE PRECISION,
-                    ema_8        DOUBLE PRECISION,
-                    ema_20       DOUBLE PRECISION,
-                    ema_39_of_15min    DOUBLE PRECISION,   -- NEW
-                    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE (symbol, timestamp)
-                );
-                """
-            )
+            cur.execute("""
+                        CREATE TABLE IF NOT EXISTS daily_bars
+                        (
+                            id
+                            SERIAL
+                            PRIMARY
+                            KEY,
+                            symbol
+                            TEXT
+                            NOT
+                            NULL,
+                            timestamp
+                            DATE
+                            NOT
+                            NULL,
+                            open
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            high
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            low
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            close
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            volume
+                            BIGINT
+                            NOT
+                            NULL,
+                            vwap
+                            DOUBLE
+                            PRECISION,
+                            vwap_upper
+                            DOUBLE
+                            PRECISION,
+                            vwap_lower
+                            DOUBLE
+                            PRECISION,
+                            session_high
+                            DOUBLE
+                            PRECISION,
+                            session_low
+                            DOUBLE
+                            PRECISION,
+                            poc
+                            DOUBLE
+                            PRECISION,
+                            atr
+                            DOUBLE
+                            PRECISION,
+                            rsi_10
+                            DOUBLE
+                            PRECISION,
+                            momentum_10
+                            DOUBLE
+                            PRECISION,
+                            ema_8
+                            DOUBLE
+                            PRECISION,
+                            ema_20
+                            DOUBLE
+                            PRECISION,
+                            ema_39_of_15min
+                            DOUBLE
+                            PRECISION,
+                            created_at
+                            TIMESTAMP
+                            DEFAULT
+                            CURRENT_TIMESTAMP,
+                            UNIQUE
+                        (
+                            symbol,
+                            timestamp
+                        )
+                            );
+                        """)
 
             # composite_session_profiles
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS composite_session_profiles (
-                    id               SERIAL PRIMARY KEY,
-                    symbol           TEXT      NOT NULL,
-                    session_date     DATE      NOT NULL,
-                    lookback_days    SMALLINT  NOT NULL,
-                    composite_poc    DOUBLE PRECISION,
-                    composite_vah    DOUBLE PRECISION,
-                    composite_val    DOUBLE PRECISION,
-                    total_volume     BIGINT,
-                    hvn_levels       JSONB,
-                    lvn_levels       JSONB,
-                    imbalance_score  DOUBLE PRECISION,
-                    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(symbol, session_date, lookback_days)
-                );
-                """
-            )
+            cur.execute("""
+                        CREATE TABLE IF NOT EXISTS composite_session_profiles
+                        (
+                            id
+                            SERIAL
+                            PRIMARY
+                            KEY,
+                            symbol
+                            TEXT
+                            NOT
+                            NULL,
+                            session_date
+                            DATE
+                            NOT
+                            NULL,
+                            lookback_days
+                            SMALLINT
+                            NOT
+                            NULL,
+                            composite_poc
+                            DOUBLE
+                            PRECISION,
+                            composite_vah
+                            DOUBLE
+                            PRECISION,
+                            composite_val
+                            DOUBLE
+                            PRECISION,
+                            total_volume
+                            BIGINT,
+                            hvn_levels
+                            JSONB,
+                            lvn_levels
+                            JSONB,
+                            imbalance_score
+                            DOUBLE
+                            PRECISION,
+                            created_at
+                            TIMESTAMP
+                            DEFAULT
+                            CURRENT_TIMESTAMP,
+                            UNIQUE
+                        (
+                            symbol,
+                            session_date,
+                            lookback_days
+                        )
+                            );
+                        """)
 
             # Indexes
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_5min_symbol_timestamp ON candles_5min(symbol, timestamp);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_15min_symbol_timestamp ON candles_15min(symbol, timestamp);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_daily_symbol_timestamp ON daily_bars(symbol, timestamp);")
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_5min_symbol_timestamp ON candles_5min(symbol, timestamp);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_15min_symbol_timestamp ON candles_15min(symbol, timestamp);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_daily_symbol_timestamp ON daily_bars(symbol, timestamp);"
-            )
-
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_csp_symbol_date ON composite_session_profiles(symbol, session_date);"
-            )
+                "CREATE INDEX IF NOT EXISTS idx_csp_symbol_date ON composite_session_profiles(symbol, session_date);")
 
             conn.commit()
             logging.info("Postgres database setup completed")
@@ -366,6 +586,259 @@ class AlpacaDataCollectorOptimized:
         hour_decimal = pst_time.hour + pst_time.minute / 60.0
 
         return MARKET_START_PST <= hour_decimal <= MARKET_END_PST
+
+    # -----------------------------------------------------------------------
+    # RVOL Implementation
+    # -----------------------------------------------------------------------
+
+    def _compute_slot_index_from_utc(self, ts: pd.Timestamp) -> Optional[int]:
+        """
+        Compute slot_index for regular session (09:30-16:00 ET) in 15m increments.
+        Input timestamp is in UTC, converts to ET for slot calculation.
+        Returns 0..25, or None if outside regular session.
+        """
+        # Convert UTC to ET for slot calculation
+        if ts.tzinfo is None:
+            ts_utc = self.utc_tz.localize(ts.to_pydatetime())
+        else:
+            ts_utc = ts.to_pydatetime()
+
+        ts_et = ts_utc.astimezone(self.est_tz)
+
+        h = ts_et.hour
+        m = ts_et.minute
+        total_min = h * 60 + m
+
+        start = 9 * 60 + 30  # 09:30 ET
+        end = 16 * 60  # 16:00 ET
+
+        if total_min < start or total_min >= end:
+            return None
+
+        return int((total_min - start) // 15)
+
+    def _get_session_date_from_utc(self, ts: pd.Timestamp) -> date:
+        """
+        Get the trading session date from a UTC timestamp.
+        Converts to ET to determine the correct trading day.
+        """
+        if ts.tzinfo is None:
+            ts_utc = self.utc_tz.localize(ts.to_pydatetime())
+        else:
+            ts_utc = ts.to_pydatetime()
+
+        ts_et = ts_utc.astimezone(self.est_tz)
+        return ts_et.date()
+
+    def calculate_rvol_15m(
+            self,
+            df: pd.DataFrame,
+            lookback_sessions: int = RVOL_LOOKBACK_SESSIONS
+    ) -> pd.DataFrame:
+        """
+        Calculate all three RVOL variants for 15-minute data:
+
+        1. Slot RVOL: volume at this slot / median volume at same slot over N prior sessions
+        2. Cumulative RVOL: cum volume at slot / median cum volume at same slot over N prior sessions
+        3. Intraday RVOL: projected EOD volume / average daily volume
+
+        Uses MEDIAN for slot/cum baselines to reduce sensitivity to outlier days (earnings, news).
+        Baselines exclude current session (shift by 1).
+
+        IMPORTANT: Timestamps remain in UTC. Slot calculations use ET internally.
+        """
+        if df.empty:
+            return df
+
+        df = df.copy()
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+        # Ensure timestamps are UTC (Alpaca returns UTC)
+        if df["timestamp"].dt.tz is None:
+            df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
+        else:
+            df["timestamp"] = df["timestamp"].dt.tz_convert("UTC")
+
+        # Compute session date (in ET) for each row - used for grouping only
+        df["_session_date"] = df["timestamp"].apply(self._get_session_date_from_utc)
+
+        # Slot index 0..25 (computed from UTC -> ET conversion)
+        df["slot_index"] = df["timestamp"].apply(self._compute_slot_index_from_utc)
+
+        # Keep only regular session slots
+        df = df[df["slot_index"].notna()].copy()
+        if df.empty:
+            return df
+
+        df["slot_index"] = df["slot_index"].astype(int)
+
+        # Cumulative volume within session
+        df = df.sort_values(["_session_date", "timestamp"]).reset_index(drop=True)
+        df["cum_volume"] = df.groupby("_session_date")["volume"].cumsum()
+
+        # Daily total volume per session
+        daily_totals = df.groupby("_session_date")["volume"].sum().reset_index()
+        daily_totals.columns = ["_session_date", "daily_total_volume"]
+
+        # Get unique sessions in order
+        sessions = df["_session_date"].unique()
+        sessions = sorted(sessions)
+        session_to_idx = {s: i for i, s in enumerate(sessions)}
+        df["_session_idx"] = df["_session_date"].map(session_to_idx)
+
+        # -----------------------------------------------------------------
+        # 1. SLOT RVOL (using median)
+        # -----------------------------------------------------------------
+        slot_baselines = []
+        for slot in range(26):
+            slot_df = df[df["slot_index"] == slot][["_session_date", "_session_idx", "volume"]].drop_duplicates(
+                "_session_date")
+            slot_df = slot_df.sort_values("_session_idx").reset_index(drop=True)
+
+            # Rolling median over prior sessions (shift excludes current)
+            slot_df["baseline"] = (
+                slot_df["volume"]
+                .shift(1)
+                .rolling(window=lookback_sessions, min_periods=RVOL_MIN_SESSIONS)
+                .median()
+            )
+            slot_df["slot_index"] = slot
+            slot_baselines.append(slot_df[["_session_date", "slot_index", "baseline"]])
+
+        slot_baseline_df = pd.concat(slot_baselines, ignore_index=True)
+        slot_baseline_df.columns = ["_session_date", "slot_index", "rvol_slot_baseline_20"]
+
+        df = df.merge(slot_baseline_df, on=["_session_date", "slot_index"], how="left")
+
+        # Apply minimum baseline floor
+        df["rvol_slot_baseline_20"] = df["rvol_slot_baseline_20"].clip(lower=RVOL_MIN_BASELINE_VOLUME)
+
+        # Compute slot RVOL
+        df["rvol_slot_20"] = np.where(
+            df["rvol_slot_baseline_20"].notna() & (df["rvol_slot_baseline_20"] > 0),
+            df["volume"] / df["rvol_slot_baseline_20"],
+            np.nan
+        )
+
+        # -----------------------------------------------------------------
+        # 2. CUMULATIVE RVOL (using median)
+        # -----------------------------------------------------------------
+        cum_baselines = []
+        for slot in range(26):
+            slot_df = df[df["slot_index"] == slot][["_session_date", "_session_idx", "cum_volume"]].drop_duplicates(
+                "_session_date")
+            slot_df = slot_df.sort_values("_session_idx").reset_index(drop=True)
+
+            slot_df["baseline"] = (
+                slot_df["cum_volume"]
+                .shift(1)
+                .rolling(window=lookback_sessions, min_periods=RVOL_MIN_SESSIONS)
+                .median()
+            )
+            slot_df["slot_index"] = slot
+            cum_baselines.append(slot_df[["_session_date", "slot_index", "baseline"]])
+
+        cum_baseline_df = pd.concat(cum_baselines, ignore_index=True)
+        cum_baseline_df.columns = ["_session_date", "slot_index", "rvol_cum_baseline_20"]
+
+        df = df.merge(cum_baseline_df, on=["_session_date", "slot_index"], how="left")
+
+        df["rvol_cum_baseline_20"] = df["rvol_cum_baseline_20"].clip(lower=RVOL_MIN_BASELINE_VOLUME)
+
+        df["rvol_cum_20"] = np.where(
+            df["rvol_cum_baseline_20"].notna() & (df["rvol_cum_baseline_20"] > 0),
+            df["cum_volume"] / df["rvol_cum_baseline_20"],
+            np.nan
+        )
+
+        # -----------------------------------------------------------------
+        # 3. INTRADAY RVOL (projected EOD volume / average daily volume)
+        # -----------------------------------------------------------------
+
+        # Average daily volume over prior N sessions
+        daily_totals = daily_totals.sort_values("_session_date").reset_index(drop=True)
+        daily_totals["avg_daily_volume_20"] = (
+            daily_totals["daily_total_volume"]
+            .shift(1)
+            .rolling(window=lookback_sessions, min_periods=RVOL_MIN_SESSIONS)
+            .mean()
+        )
+
+        # Merge daily totals
+        df = df.merge(
+            daily_totals[["_session_date", "daily_total_volume", "avg_daily_volume_20"]],
+            on="_session_date",
+            how="left"
+        )
+
+        # pct of day completed at this slot for THIS session
+        df["_pct_of_day_actual"] = np.where(
+            df["daily_total_volume"] > 0,
+            df["cum_volume"] / df["daily_total_volume"],
+            np.nan
+        )
+
+        # Compute typical % at each slot (median across prior sessions)
+        pct_baselines = []
+        for slot in range(26):
+            slot_df = df[df["slot_index"] == slot][
+                ["_session_date", "_session_idx", "_pct_of_day_actual"]].drop_duplicates("_session_date")
+            slot_df = slot_df.sort_values("_session_idx").reset_index(drop=True)
+
+            slot_df["pct_typical"] = (
+                slot_df["_pct_of_day_actual"]
+                .shift(1)
+                .rolling(window=lookback_sessions, min_periods=RVOL_MIN_SESSIONS)
+                .median()
+            )
+            slot_df["slot_index"] = slot
+            pct_baselines.append(slot_df[["_session_date", "slot_index", "pct_typical"]])
+
+        pct_baseline_df = pd.concat(pct_baselines, ignore_index=True)
+        pct_baseline_df.columns = ["_session_date", "slot_index", "pct_of_day_typical"]
+
+        df = df.merge(pct_baseline_df, on=["_session_date", "slot_index"], how="left")
+
+        # Projected EOD = cum_volume / pct_of_day_typical
+        # Clamp pct_of_day_typical to avoid wild projections early in day
+        df["_pct_of_day_typical_clamped"] = df["pct_of_day_typical"].clip(lower=0.05)
+
+        df["_projected_eod_volume"] = np.where(
+            df["_pct_of_day_typical_clamped"].notna() & (df["_pct_of_day_typical_clamped"] > 0),
+            df["cum_volume"] / df["_pct_of_day_typical_clamped"],
+            np.nan
+        )
+
+        # Intraday RVOL = projected EOD / avg daily volume
+        df["intraday_rvol_20"] = np.where(
+            df["avg_daily_volume_20"].notna() & (df["avg_daily_volume_20"] > RVOL_MIN_BASELINE_VOLUME),
+            df["_projected_eod_volume"] / df["avg_daily_volume_20"],
+            np.nan
+        )
+
+        # -----------------------------------------------------------------
+        # Round and clean up
+        # -----------------------------------------------------------------
+        df["rvol_slot_20"] = df["rvol_slot_20"].round(4)
+        df["rvol_cum_20"] = df["rvol_cum_20"].round(4)
+        df["intraday_rvol_20"] = df["intraday_rvol_20"].round(4)
+        df["rvol_slot_baseline_20"] = df["rvol_slot_baseline_20"].round(2)
+        df["rvol_cum_baseline_20"] = df["rvol_cum_baseline_20"].round(2)
+        df["avg_daily_volume_20"] = df["avg_daily_volume_20"].round(2)
+        df["pct_of_day_typical"] = df["pct_of_day_typical"].round(4)
+
+        # Drop intermediate columns (prefixed with _)
+        cols_to_drop = [
+            "_session_idx", "_session_date", "daily_total_volume", "_pct_of_day_actual",
+            "_pct_of_day_typical_clamped", "_projected_eod_volume"
+        ]
+        df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors="ignore")
+
+        # Restore original sort by timestamp
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        return df
 
     # -----------------------------------------------------------------------
     # Indicator calculations
@@ -412,7 +885,7 @@ class AlpacaDataCollectorOptimized:
     def calculate_vwap_series(
             self, df: pd.DataFrame, include_bands: bool = False, multiplier: float = 1
     ) -> pd.DataFrame:
-        """Calculate VWAP for each bar with optional bands - optimized version."""
+        """Calculate VWAP for each bar with optional bands."""
         if df.empty:
             return df
 
@@ -425,11 +898,16 @@ class AlpacaDataCollectorOptimized:
         df["typical_price"] = (df["high"] + df["low"] + df["close"]) / 3
         df["pv"] = df["typical_price"] * df["volume"]
 
-        if "date" not in df.columns:
-            df["date"] = df["timestamp"].dt.date
+        # Get date in ET for session grouping (but don't modify timestamp)
+        if df["timestamp"].dt.tz is None:
+            ts_for_date = df["timestamp"].dt.tz_localize("UTC")
+        else:
+            ts_for_date = df["timestamp"].dt.tz_convert("UTC")
 
-        df["cum_pv"] = df.groupby("date")["pv"].cumsum()
-        df["cum_volume"] = df.groupby("date")["volume"].cumsum()
+        df["_date_et"] = ts_for_date.dt.tz_convert(self.est_tz).dt.date
+
+        df["cum_pv"] = df.groupby("_date_et")["pv"].cumsum()
+        df["cum_volume"] = df.groupby("_date_et")["volume"].cumsum()
 
         df["vwap"] = 0.0
         mask = df["cum_volume"] > 0
@@ -439,8 +917,8 @@ class AlpacaDataCollectorOptimized:
             df["vwap_upper"] = df["vwap"]
             df["vwap_lower"] = df["vwap"]
 
-            for date_val in df["date"].unique():
-                date_mask = df["date"] == date_val
+            for date_val in df["_date_et"].unique():
+                date_mask = df["_date_et"] == date_val
                 date_df = df[date_mask]
 
                 if len(date_df) == 0:
@@ -458,9 +936,7 @@ class AlpacaDataCollectorOptimized:
                     if volume_sum > 0:
                         weights = volumes[: i + 1] / volume_sum
                         weighted_mean = vwap_values[i]
-                        variance = np.sum(
-                            weights * (typical_prices[: i + 1] - weighted_mean) ** 2
-                        )
+                        variance = np.sum(weights * (typical_prices[: i + 1] - weighted_mean) ** 2)
                         std_dev = np.sqrt(variance) if variance > 0 else 0
 
                         upper_band.append(weighted_mean + multiplier * std_dev)
@@ -472,7 +948,7 @@ class AlpacaDataCollectorOptimized:
                 df.loc[date_mask, "vwap_upper"] = np.round(upper_band, 2)
                 df.loc[date_mask, "vwap_lower"] = np.round(lower_band, 2)
 
-        columns_to_drop = ["typical_price", "pv", "cum_pv", "cum_volume"]
+        columns_to_drop = ["typical_price", "pv", "cum_pv", "cum_volume", "_date_et"]
         df = df.drop(columns=[c for c in columns_to_drop if c in df.columns], axis=1)
 
         return df
@@ -486,34 +962,22 @@ class AlpacaDataCollectorOptimized:
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         for period in periods:
-            df[f"ema_{period}"] = (
-                df["close"].ewm(span=period, adjust=False).mean().round(3)
-            )
+            df[f"ema_{period}"] = df["close"].ewm(span=period, adjust=False).mean().round(3)
 
         return df
 
     # -----------------------------------------------------------------------
     # Session stats & volume profile
     # -----------------------------------------------------------------------
-    def resample_to_daily_bars(self, day_dfs: Dict[date, pd.DataFrame], symbol: str) -> pd.DataFrame:
-        """
-        Resample 1-minute market hours data to daily bars.
 
-        For each day:
-        - Open: first bar's open
-        - High: max of all highs
-        - Low: min of all lows
-        - Close: last bar's close
-        - Volume: sum of all volumes
-        - VWAP: volume-weighted average price
-        """
+    def resample_to_daily_bars(self, day_dfs: Dict[date, pd.DataFrame], symbol: str) -> pd.DataFrame:
+        """Resample 1-minute market hours data to daily bars."""
         daily_records = []
 
         for d, day_df in sorted(day_dfs.items()):
             if day_df.empty:
                 continue
 
-            # Sort by timestamp to ensure correct open/close
             day_df = day_df.sort_values("timestamp").reset_index(drop=True)
 
             daily_record = {
@@ -526,10 +990,11 @@ class AlpacaDataCollectorOptimized:
                 "volume": int(day_df["volume"].sum()),
             }
 
-            # Calculate VWAP for the day
             if daily_record["volume"] > 0:
                 typical_price = (day_df["high"] + day_df["low"] + day_df["close"]) / 3
-                daily_record["vwap"] = round(float((typical_price * day_df["volume"]).sum() / daily_record["volume"]), 2)
+                daily_record["vwap"] = round(
+                    float((typical_price * day_df["volume"]).sum() / daily_record["volume"]), 2
+                )
             else:
                 daily_record["vwap"] = float(daily_record["close"])
 
@@ -546,29 +1011,16 @@ class AlpacaDataCollectorOptimized:
     def fetch_and_process_session_data(
             self, symbol: str, dates: List[str]
     ) -> Tuple[Dict[str, Optional[SessionStats]], pd.DataFrame]:
-        """Fetch and process multiple days of session data at once.
-
-        Now also computes and stores composite session profiles (2, 3, 4 days)
-        for each session_date using 1-minute bars.
-
-        IMPORTANT: Composite profiles EXCLUDE the current day.
-        For example, for session_date 12/05/2025:
-          - 2-day profile uses data from [12/03, 12/04]
-          - 3-day profile uses data from [12/02, 12/03, 12/04]
-          - 4-day profile uses data from [12/01, 12/02, 12/03, 12/04]
-        """
+        """Fetch and process multiple days of session data at once."""
         if not dates:
-            return {}
+            return {}, pd.DataFrame()
 
-        # Convert input strings (YYYY-MM-DD) -> date objects and sort them
         dates_as_date = sorted([datetime.strptime(d, "%Y-%m-%d").date() for d in dates])
         est = self.est_tz
 
-        # ========== SINGLE API call spanning all dates ==========
         start_date = dates_as_date[0]
         end_date = dates_as_date[-1]
 
-        # Fetch from first day 4:00 AM to last day 8:00 PM to capture everything
         session_start = est.localize(
             datetime.combine(start_date, datetime.min.time()).replace(hour=4, minute=0)
         )
@@ -589,26 +1041,27 @@ class AlpacaDataCollectorOptimized:
             df = bars.df.reset_index()
 
             if df.empty:
-                return {d.isoformat(): None for d in dates_as_date}
+                return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame()
 
             if "timestamp" not in df.columns:
                 logging.error(f"No timestamp column found for {symbol}")
-                return {d.isoformat(): None for d in dates_as_date}
+                return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame()
 
             df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-            # ========== Filter to market hours only (9:30 AM - 3:59 PM EST) ==========
-            df["timestamp_est"] = df["timestamp"].dt.tz_convert(est)
-            df["time_decimal"] = df["timestamp_est"].dt.hour + df["timestamp_est"].dt.minute / 60.0
-            df = df[(df["time_decimal"] >= 9.5) & (df["time_decimal"] < 16.0)].copy()
-            df = df.drop(columns=["timestamp_est", "time_decimal"])
+            # Filter to regular hours only (9:30 AM - 3:59 PM ET)
+            # Convert to ET for filtering, but keep original timestamp
+            df["_timestamp_est"] = df["timestamp"].dt.tz_convert(est)
+            df["_time_decimal"] = df["_timestamp_est"].dt.hour + df["_timestamp_est"].dt.minute / 60.0
+            df = df[(df["_time_decimal"] >= 9.5) & (df["_time_decimal"] < 16.0)].copy()
+
+            # Get date in ET for grouping
+            df["date"] = df["_timestamp_est"].dt.date
+            df = df.drop(columns=["_timestamp_est", "_time_decimal"])
 
             if df.empty:
-                return {d.isoformat(): None for d in dates_as_date}
+                return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame()
 
-            df["date"] = df["timestamp"].dt.tz_convert(est).dt.date
-
-            # ========== Split into date -> DataFrame mapping ==========
             day_dfs: Dict[date, pd.DataFrame] = {}
             for d in dates_as_date:
                 day_df = df[df["date"] == d].copy()
@@ -618,27 +1071,18 @@ class AlpacaDataCollectorOptimized:
 
         except Exception as e:
             logging.error(f"Failed to fetch session data for {symbol}: {e}")
-            return {d.isoformat(): None for d in dates_as_date}
+            return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame()
 
         results: Dict[str, Optional[SessionStats]] = {}
         profiles_to_store: List[CompositeSessionProfile] = []
 
-        # ========== Helper to build composite profile ==========
         def _build_composite(date_idx: int, lookback_days: int) -> Optional[CompositeSessionProfile]:
-            """Build composite profile by combining DataFrames based on date index and lookback.
-
-            IMPORTANT: Excludes the current day (date_idx) and uses the previous N days.
-            For example, if date_idx points to 12/05 and lookback_days=2:
-              - Uses data from [12/03, 12/04] (excludes 12/05)
-              - Stores session_date as 12/05 (the "as-of" date)
-            """
-            # Exclude current day: use dates from (date_idx - lookback_days) to (date_idx - 1)
-            end_idx = date_idx  # exclusive - current day not included
+            end_idx = date_idx
             start_idx = date_idx - lookback_days
             if start_idx < 0:
                 return None
 
-            window_dates = dates_as_date[start_idx:end_idx]  # excludes date_idx
+            window_dates = dates_as_date[start_idx:end_idx]
             dfs_to_combine = [day_dfs[d] for d in window_dates if not day_dfs[d].empty]
             if not dfs_to_combine:
                 return None
@@ -669,7 +1113,7 @@ class AlpacaDataCollectorOptimized:
 
                 return CompositeSessionProfile(
                     symbol=symbol,
-                    session_date=dates_as_date[date_idx],  # Store as-of date (current day)
+                    session_date=dates_as_date[date_idx],
                     lookback_days=lookback_days,
                     composite_poc=vp.poc_price,
                     composite_vah=vp.value_area_high,
@@ -681,12 +1125,10 @@ class AlpacaDataCollectorOptimized:
                 )
             except Exception as e:
                 logging.error(
-                    f"Failed composite profile for {symbol} lb={lookback_days} "
-                    f"on {dates_as_date[date_idx]}: {e}"
+                    f"Failed composite profile for {symbol} lb={lookback_days} on {dates_as_date[date_idx]}: {e}"
                 )
                 return None
 
-        # ========== Main loop: iterate by index over dates_as_date ==========
         for idx, d in enumerate(dates_as_date):
             date_str = d.isoformat()
             day_df = day_dfs[d]
@@ -704,16 +1146,10 @@ class AlpacaDataCollectorOptimized:
                 session_low = volume_profile_metrics.value_area_low
                 poc = volume_profile_metrics.poc_price
             except Exception as e:
-                logging.warning(
-                    f"Could not calculate volume profile for {symbol} on {date_str}: {e}"
-                )
+                logging.warning(f"Could not calculate volume profile for {symbol} on {date_str}: {e}")
                 session_high = day_df["high"].max()
                 session_low = day_df["low"].min()
-                poc = (
-                    day_df.loc[day_df["volume"].idxmax(), "close"]
-                    if not day_df.empty
-                    else None
-                )
+                poc = day_df.loc[day_df["volume"].idxmax(), "close"] if not day_df.empty else None
 
             vwap_upper = (
                 day_df["vwap_upper"].iloc[-1]
@@ -736,18 +1172,14 @@ class AlpacaDataCollectorOptimized:
                 session_volume=total_volume,
             )
 
-            # Build composite profiles for lookbacks 2, 3, 4 (excluding current day)
-            # Note: lookback=1 would be redundant since it's just yesterday's single-day profile
             for lb in [2, 3, 4]:
                 profile = _build_composite(idx, lb)
                 if profile:
                     profiles_to_store.append(profile)
 
-        # Single batch insert for all profiles
         if profiles_to_store:
             self._store_composite_session_profiles_batch(profiles_to_store)
 
-        # ========== Resample to daily bars ==========
         daily_bars_df = self.resample_to_daily_bars(day_dfs, symbol)
 
         return results, daily_bars_df
@@ -797,8 +1229,7 @@ class AlpacaDataCollectorOptimized:
             )
 
             conn.commit()
-            logging.debug(
-                f"Batch stored {len(profiles)} composite profiles for {profiles[0].symbol if profiles else 'N/A'}")
+            logging.debug(f"Batch stored {len(profiles)} composite profiles")
 
         except Exception as e:
             conn.rollback()
@@ -810,9 +1241,7 @@ class AlpacaDataCollectorOptimized:
     def calculate_volume_profile_optimized(
             self, df: pd.DataFrame, price_levels: int = 70
     ) -> VolumeProfileMetrics:
-        """
-        Numba-accelerated volume profile calculation - exact match with original logic.
-        """
+        """Numba-accelerated volume profile calculation."""
         if df.empty:
             raise ValueError("DataFrame is empty")
 
@@ -820,7 +1249,6 @@ class AlpacaDataCollectorOptimized:
         low_price = df["low"].min()
         price_range = high_price - low_price
 
-        # Handle zero range case
         if price_range == 0:
             total_volume = int(df["volume"].sum())
             single_price = float(high_price)
@@ -843,22 +1271,18 @@ class AlpacaDataCollectorOptimized:
                 price_levels=profile_levels,
             )
 
-        # Extract numpy arrays
         lows = df["low"].values.astype(np.float64)
         highs = df["high"].values.astype(np.float64)
         volumes = df["volume"].values.astype(np.float64)
 
-        # Build price bins
         price_bins = np.linspace(low_price, high_price, price_levels + 1)
         bin_lowers = price_bins[:-1].astype(np.float64)
         bin_uppers = price_bins[1:].astype(np.float64)
 
-        # Numba-accelerated volume distribution
         volume_at_price = _distribute_volume_exact(
             lows, highs, volumes, bin_lowers, bin_uppers, price_levels
         )
 
-        # Numba-accelerated value area calculation
         poc_index, low_index, high_index, total_volume = _calculate_value_area(
             volume_at_price, price_levels
         )
@@ -867,7 +1291,6 @@ class AlpacaDataCollectorOptimized:
         value_area_high = (price_bins[high_index] + price_bins[high_index + 1]) / 2
         value_area_low = (price_bins[low_index] + price_bins[low_index + 1]) / 2
 
-        # Build profile levels (this part is fast enough in Python)
         non_zero_indices = np.where(volume_at_price > 0)[0]
 
         profile_levels: List[VolumeProfileLevel] = []
@@ -892,98 +1315,10 @@ class AlpacaDataCollectorOptimized:
         )
 
     # -----------------------------------------------------------------------
-    # Composite profile helpers (NEW)
-    # -----------------------------------------------------------------------
-
-    def calculate_composite_profile_from_candles(
-            self, df: pd.DataFrame, price_levels: int = 70
-    ) -> VolumeProfileMetrics:
-        """
-        Build a multi-day composite volume profile using the existing
-        optimized volume profile logic.
-        """
-        return self.calculate_volume_profile_optimized(df, price_levels=price_levels)
-
-    def _store_composite_session_profile(
-            self,
-            profile: CompositeSessionProfile,
-    ):
-        """Upsert a CompositeSessionProfile into Postgres."""
-        conn = self._get_pg_conn()
-        cur = conn.cursor()
-        try:
-            # Make absolutely sure we don't pass any numpy types to JSON/psycopg
-            hvn_levels = [float(x) for x in (profile.hvn_levels or [])]
-            lvn_levels = [float(x) for x in (profile.lvn_levels or [])]
-
-            total_volume = int(profile.total_volume) if profile.total_volume is not None else None
-            imbalance_score = float(profile.imbalance_score) if profile.imbalance_score is not None else None
-            composite_poc = float(profile.composite_poc) if profile.composite_poc is not None else None
-            composite_vah = float(profile.composite_vah) if profile.composite_vah is not None else None
-            composite_val = float(profile.composite_val) if profile.composite_val is not None else None
-
-            cur.execute(
-                """
-                INSERT INTO public.composite_session_profiles (symbol,
-                                                               session_date,
-                                                               lookback_days,
-                                                               composite_poc,
-                                                               composite_vah,
-                                                               composite_val,
-                                                               total_volume,
-                                                               hvn_levels,
-                                                               lvn_levels,
-                                                               imbalance_score)
-                VALUES (%(symbol)s,
-                        %(session_date)s,
-                        %(lookback_days)s,
-                        %(composite_poc)s,
-                        %(composite_vah)s,
-                        %(composite_val)s,
-                        %(total_volume)s,
-                        %(hvn_levels)s,
-                        %(lvn_levels)s,
-                        %(imbalance_score)s) ON CONFLICT (symbol, session_date, lookback_days)
-                DO
-                UPDATE SET
-                    composite_poc = EXCLUDED.composite_poc,
-                    composite_vah = EXCLUDED.composite_vah,
-                    composite_val = EXCLUDED.composite_val,
-                    total_volume = EXCLUDED.total_volume,
-                    hvn_levels = EXCLUDED.hvn_levels,
-                    lvn_levels = EXCLUDED.lvn_levels,
-                    imbalance_score = EXCLUDED.imbalance_score;
-                """,
-                {
-                    "symbol": profile.symbol,
-                    "session_date": profile.session_date,
-                    "lookback_days": int(profile.lookback_days),
-                    "composite_poc": composite_poc,
-                    "composite_vah": composite_vah,
-                    "composite_val": composite_val,
-                    "total_volume": total_volume,
-                    "hvn_levels": json.dumps(hvn_levels),
-                    "lvn_levels": json.dumps(lvn_levels),
-                    "imbalance_score": imbalance_score,
-                },
-            )
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            logging.error(
-                f"Error storing composite profile for {profile.symbol}, "
-                f"session_date={profile.session_date}, lb={profile.lookback_days}: {e}"
-            )
-            raise
-        finally:
-            cur.close()
-            conn.close()
-
-    # -----------------------------------------------------------------------
     # Symbol processing / indicators
     # -----------------------------------------------------------------------
 
-    def process_symbol_batch(self, symbols: List[str], days_back: int = 180) -> Dict[str, List[dict]]:
+    def process_symbol_batch(self, symbols: List[str], days_back: int = 360) -> Dict[str, List[dict]]:
         """Process a batch of symbols in parallel."""
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days_back)
@@ -1037,7 +1372,6 @@ class AlpacaDataCollectorOptimized:
             if daily_df.empty:
                 return []
 
-                # Calculate daily indicators on resampled data
             daily_df = self.calculate_daily_indicators_optimized(daily_df)
 
             result: List[dict] = []
@@ -1049,11 +1383,8 @@ class AlpacaDataCollectorOptimized:
                     "symbol": row["symbol"],
                     "timestamp": date_str,
                     "open": float(row["open"]) if pd.notna(row["open"]) else None,
-                    "high": float(stats.highest_high)
-                    if stats and stats.highest_high
-                    else float(row["high"])
-                    if pd.notna(row["high"])
-                    else None,
+                    "high": float(stats.highest_high) if stats and stats.highest_high else float(
+                        row["high"]) if pd.notna(row["high"]) else None,
                     "low": float(row["low"]) if pd.notna(row["low"]) else None,
                     "close": float(row["close"]) if pd.notna(row["close"]) else None,
                     "volume": int(stats.session_volume) if stats and stats.session_volume else 0,
@@ -1082,6 +1413,8 @@ class AlpacaDataCollectorOptimized:
         if df.empty:
             return df
 
+        df = df.copy()
+
         df["high_low"] = df["high"] - df["low"]
         df["high_pc"] = abs(df["high"] - df["close"].shift(1))
         df["low_pc"] = abs(df["low"] - df["close"].shift(1))
@@ -1109,9 +1442,7 @@ class AlpacaDataCollectorOptimized:
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_symbol = {
-                executor.submit(
-                    self.get_market_hours_data_single, symbol, timeframe, days_back
-                ): symbol
+                executor.submit(self.get_market_hours_data_single, symbol, timeframe, days_back): symbol
                 for symbol in symbols
             }
 
@@ -1127,7 +1458,7 @@ class AlpacaDataCollectorOptimized:
         return results
 
     def get_market_hours_data_single(
-            self, symbol: str, timeframe: TimeFrame, days_back: int = 10
+            self, symbol: str, timeframe: TimeFrame, days_back: int = 360
     ) -> pd.DataFrame:
         """Fetch market hours data for a single symbol."""
         end_date = datetime.now(self.est_tz)
@@ -1148,13 +1479,22 @@ class AlpacaDataCollectorOptimized:
             if df.empty:
                 return pd.DataFrame()
 
+            # Alpaca returns timestamps in UTC - keep them that way
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+            # Filter to market hours (use the existing method which handles timezone conversion)
             df["is_market_hours"] = df["timestamp"].apply(self.is_market_hours)
             market_hours_df = df[df["is_market_hours"]].copy()
+            market_hours_df = market_hours_df.drop(columns=["is_market_hours"], errors="ignore")
 
             market_hours_df = market_hours_df.tail(MAX_BARS)
 
             market_hours_df = self.calculate_vwap_series(market_hours_df)
             market_hours_df = self.calculate_ema_series(market_hours_df, [8, 20, 39])
+
+            # RVOL fields only for 15m
+            if timeframe.amount == 15 and timeframe.unit == TimeFrameUnit.Minute:
+                market_hours_df = self.calculate_rvol_15m(market_hours_df, lookback_sessions=RVOL_LOOKBACK_SESSIONS)
 
             available_columns = [
                 "symbol",
@@ -1169,7 +1509,28 @@ class AlpacaDataCollectorOptimized:
                 "ema_20",
                 "ema_39",
             ]
-            market_hours_df = market_hours_df[available_columns]
+
+            if timeframe.amount == 15 and timeframe.unit == TimeFrameUnit.Minute:
+                available_columns += [
+                    "slot_index",
+                    "cum_volume",
+                    "rvol_slot_20",
+                    "rvol_slot_baseline_20",
+                    "rvol_cum_20",
+                    "rvol_cum_baseline_20",
+                    "intraday_rvol_20",
+                    "avg_daily_volume_20",
+                    "pct_of_day_typical",
+                ]
+
+            market_hours_df = market_hours_df[[c for c in available_columns if c in market_hours_df.columns]]
+
+            # Convert timestamp to UTC string format for storage (remove timezone info for DB)
+            if "timestamp" in market_hours_df.columns:
+                # Ensure UTC, then remove tz for storage
+                if market_hours_df["timestamp"].dt.tz is not None:
+                    market_hours_df["timestamp"] = market_hours_df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(
+                        None)
 
             return market_hours_df
 
@@ -1198,11 +1559,13 @@ class AlpacaDataCollectorOptimized:
                     symbols_to_delete.add(symbol)
                     df = df.copy()
                     if 'timestamp' in df.columns:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        # Store as UTC timestamp string (no timezone suffix)
                         df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
                     records = df.to_dict('records')
                     all_records.extend(records)
 
-            # Optional: delete existing records for these symbols (keeps table smaller)
+            # Delete existing records for these symbols (full rebuild)
             if symbols_to_delete:
                 placeholders = ",".join(["%s"] * len(symbols_to_delete))
                 cur.execute(
@@ -1222,9 +1585,7 @@ class AlpacaDataCollectorOptimized:
                     {", ".join([f"{col}=EXCLUDED.{col}" for col in columns if col not in ("symbol", "timestamp")])}
                 """
 
-                batched = [
-                    [record.get(col) for col in columns] for record in all_records
-                ]
+                batched = [[record.get(col) for col in columns] for record in all_records]
 
                 for i in range(0, len(batched), DB_BATCH_SIZE):
                     execute_batch(
@@ -1262,37 +1623,18 @@ class AlpacaDataCollectorOptimized:
 
             symbols = list(all_bars.keys())
             placeholders = ",".join(["%s"] * len(symbols))
-            cur.execute(
-                f"DELETE FROM daily_bars WHERE symbol IN ({placeholders})", symbols
-            )
+            cur.execute(f"DELETE FROM daily_bars WHERE symbol IN ({placeholders})", symbols)
 
             columns = [
-                "symbol",
-                "timestamp",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "vwap",
-                "vwap_upper",
-                "vwap_lower",
-                "session_high",
-                "session_low",
-                "poc",
-                "atr",
-                "rsi_10",
-                "momentum_10",
-                "ema_8",
-                "ema_20",
-                "ema_39_of_15min",
+                "symbol", "timestamp", "open", "high", "low", "close", "volume",
+                "vwap", "vwap_upper", "vwap_lower", "session_high", "session_low",
+                "poc", "atr", "rsi_10", "momentum_10", "ema_8", "ema_20", "ema_39_of_15min",
             ]
             col_list = ",".join(columns)
             placeholders = ",".join(["%s"] * len(columns))
 
             insert_sql = f"""
-                INSERT INTO daily_bars
-                ({col_list})
+                INSERT INTO daily_bars ({col_list})
                 VALUES ({placeholders})
                 ON CONFLICT (symbol, timestamp) DO UPDATE SET
                 {", ".join([f"{col}=EXCLUDED.{col}" for col in columns if col not in ("symbol", "timestamp")])}
@@ -1300,36 +1642,18 @@ class AlpacaDataCollectorOptimized:
 
             batched = [
                 [
-                    bar["symbol"],
-                    bar["timestamp"],
-                    bar["open"],
-                    bar["high"],
-                    bar["low"],
-                    bar["close"],
-                    bar["volume"],
-                    bar.get("vwap"),
-                    bar.get("vwap_upper"),
-                    bar.get("vwap_lower"),
-                    bar.get("session_high"),
-                    bar.get("session_low"),
-                    bar.get("poc"),
-                    bar.get("atr"),
-                    bar.get("rsi_10"),
-                    bar.get("momentum_10"),
-                    bar.get("ema_8"),
-                    bar.get("ema_20"),
-                    bar.get("ema_39_of_15min"),
+                    bar["symbol"], bar["timestamp"], bar["open"], bar["high"],
+                    bar["low"], bar["close"], bar["volume"], bar.get("vwap"),
+                    bar.get("vwap_upper"), bar.get("vwap_lower"), bar.get("session_high"),
+                    bar.get("session_low"), bar.get("poc"), bar.get("atr"),
+                    bar.get("rsi_10"), bar.get("momentum_10"), bar.get("ema_8"),
+                    bar.get("ema_20"), bar.get("ema_39_of_15min"),
                 ]
                 for bar in all_records
             ]
 
             for i in range(0, len(batched), DB_BATCH_SIZE):
-                execute_batch(
-                    cur,
-                    insert_sql,
-                    batched[i: i + DB_BATCH_SIZE],
-                    page_size=DB_BATCH_SIZE,
-                )
+                execute_batch(cur, insert_sql, batched[i: i + DB_BATCH_SIZE], page_size=DB_BATCH_SIZE)
 
             conn.commit()
             logging.info(f"Batch stored {len(all_records)} daily bars")
@@ -1342,10 +1666,7 @@ class AlpacaDataCollectorOptimized:
             conn.close()
 
     def update_daily_bars_with_ema39_of_15min(self, symbols: List[str]):
-        """
-        For each symbol/date, set daily_bars.ema_39_of_15min to the last
-        15-minute ema_39 value of that day from candles_15min.
-        """
+        """Set daily_bars.ema_39_of_15min to the last 15-minute ema_39 value of that day."""
         if not symbols:
             return
 
@@ -1376,9 +1697,7 @@ class AlpacaDataCollectorOptimized:
                 (symbols,),
             )
             conn.commit()
-            logging.info(
-                f"Updated ema_39_of_15min in daily_bars for {len(symbols)} symbols"
-            )
+            logging.info(f"Updated ema_39_of_15min in daily_bars for {len(symbols)} symbols")
         except Exception as e:
             conn.rollback()
             logging.error(f"Error updating ema_39_of_15min: {e}")
@@ -1390,10 +1709,10 @@ class AlpacaDataCollectorOptimized:
     # Orchestration & summary
     # -----------------------------------------------------------------------
 
-    def collect_all_data_optimized(self, incremental: bool = False):
-        """Main optimized method to collect data for all tickers."""
+    def collect_all_data(self, days_back: int = 360):
+        """Main method to collect data for all tickers (full rebuild)."""
         self.start_time = time.time()
-        logging.info("Starting optimized data collection process")
+        logging.info("Starting data collection process (full rebuild)")
 
         self.setup_database()
 
@@ -1412,25 +1731,22 @@ class AlpacaDataCollectorOptimized:
                 f"Processing batch {i // BATCH_SIZE + 1}/{(len(tickers) - 1) // BATCH_SIZE + 1}: {batch}"
             )
 
-            days_back = 360 if not incremental else 1
             daily_bars_batch = self.process_symbol_batch(batch, days_back)
-
-            # Store daily bars (session stats included)
             self.batch_store_daily_bars(daily_bars_batch)
 
-            # Fetch & store 5min candles (used for composite profile)
+            # Fetch & store 5min candles
             data_5min = self.get_market_hours_data_batch(
-                batch, TimeFrame(5, TimeFrameUnit.Minute)
+                batch, TimeFrame(5, TimeFrameUnit.Minute), days_back=days_back
             )
             self.batch_store_data(data_5min, "candles_5min")
 
-            # Fetch & store 15min candles
+            # Fetch & store 15min candles (includes RVOL fields)
             data_15min = self.get_market_hours_data_batch(
-                batch, TimeFrame(15, TimeFrameUnit.Minute)
+                batch, TimeFrame(15, TimeFrameUnit.Minute), days_back=days_back
             )
             self.batch_store_data(data_15min, "candles_15min")
 
-            # Now that candles_15min are in DB, backfill daily_bars.ema_39_of_15min
+            # Backfill daily_bars.ema_39_of_15min
             self.update_daily_bars_with_ema39_of_15min(batch)
 
             batch_time = time.time() - batch_start_time
@@ -1440,9 +1756,7 @@ class AlpacaDataCollectorOptimized:
         logging.info(f"Data collection completed in {total_time:.2f} seconds")
         logging.info(f"Total API calls: {self.api_call_count}")
         logging.info(f"Average time per ticker: {total_time / len(tickers):.2f} seconds")
-        logging.info(
-            f"API calls per ticker: {self.api_call_count / len(tickers):.2f}"
-        )
+        logging.info(f"API calls per ticker: {self.api_call_count / len(tickers):.2f}")
 
     def get_data_summary(self):
         """Print summary of stored data from Postgres."""
@@ -1453,25 +1767,24 @@ class AlpacaDataCollectorOptimized:
             tables = ["candles_5min", "candles_15min", "daily_bars", "composite_session_profiles"]
 
             for table in tables:
-                cur.execute(
-                    f"""
-                    SELECT 
-                        COUNT(DISTINCT symbol) AS symbol_count,
-                        COUNT(*) AS total_records,
-                        MIN(session_date) AS earliest,
-                        MAX(session_date) AS latest
-                    FROM {table}
-                    """
-                    if table == "composite_session_profiles"
-                    else f"""
-                    SELECT 
-                        COUNT(DISTINCT symbol) AS symbol_count,
-                        COUNT(*) AS total_records,
-                        MIN(timestamp) AS earliest,
-                        MAX(timestamp) AS latest
-                    FROM {table}
-                    """
-                )
+                if table == "composite_session_profiles":
+                    cur.execute(f"""
+                        SELECT 
+                            COUNT(DISTINCT symbol) AS symbol_count,
+                            COUNT(*) AS total_records,
+                            MIN(session_date) AS earliest,
+                            MAX(session_date) AS latest
+                        FROM {table}
+                    """)
+                else:
+                    cur.execute(f"""
+                        SELECT 
+                            COUNT(DISTINCT symbol) AS symbol_count,
+                            COUNT(*) AS total_records,
+                            MIN(timestamp) AS earliest,
+                            MAX(timestamp) AS latest
+                        FROM {table}
+                    """)
                 symbol_count, total_records, earliest, latest = cur.fetchone()
 
                 print(f"\n{table} Summary:")
@@ -1479,34 +1792,53 @@ class AlpacaDataCollectorOptimized:
                 print(f"  Total Records: {total_records}")
                 print(f"  Date Range: {earliest} to {latest}")
 
+            # RVOL quality check for 15min
+            cur.execute("""
+                        SELECT COUNT(*)                                                                     as total_rows,
+                               COUNT(rvol_slot_20)                                                          as slot_rvol_populated,
+                               COUNT(rvol_cum_20)                                                           as cum_rvol_populated,
+                               COUNT(intraday_rvol_20)                                                      as intraday_rvol_populated,
+                               ROUND(AVG(rvol_slot_20)::numeric, 2)                                         as avg_slot_rvol,
+                               ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rvol_slot_20)::numeric, 2) as median_slot_rvol,
+                               ROUND(AVG(intraday_rvol_20)::numeric, 2)                                     as avg_intraday_rvol
+                        FROM candles_15min
+                        WHERE timestamp > CURRENT_DATE - INTERVAL '30 days'
+                        """)
+            row = cur.fetchone()
+            if row:
+                print(f"\nRVOL Quality (last 30 days):")
+                print(f"  Total rows: {row[0]}")
+                print(f"  Slot RVOL populated: {row[1]} ({100 * row[1] / max(row[0], 1):.1f}%)")
+                print(f"  Cum RVOL populated: {row[2]} ({100 * row[2] / max(row[0], 1):.1f}%)")
+                print(f"  Intraday RVOL populated: {row[3]} ({100 * row[3] / max(row[0], 1):.1f}%)")
+                print(f"  Avg Slot RVOL: {row[4]}")
+                print(f"  Median Slot RVOL: {row[5]}")
+                print(f"  Avg Intraday RVOL: {row[6]}")
+
         finally:
             cur.close()
             conn.close()
 
 
 def main():
-    """Main function to run the optimized data collector."""
+    """Main function to run the data collector."""
     API_KEY = os.getenv("APCA_API_KEY_ID")
     SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 
     if not API_KEY or not SECRET_KEY:
-        print(
-            "Error: Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables"
-        )
+        print("Error: Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables")
         return
 
     try:
         collector = AlpacaDataCollectorOptimized(API_KEY, SECRET_KEY)
 
         start_time = time.time()
-        collector.collect_all_data_optimized(incremental=False)
+        collector.collect_all_data(days_back=360)
 
         collector.get_data_summary()
 
         total_time = time.time() - start_time
-        print(
-            f"\n✅ Total execution time: {total_time:.2f} seconds ({total_time / 60:.2f} minutes)"
-        )
+        print(f"\n✅ Total execution time: {total_time:.2f} seconds ({total_time / 60:.2f} minutes)")
 
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}")
