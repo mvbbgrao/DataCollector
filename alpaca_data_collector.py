@@ -4,8 +4,14 @@ Alpaca Candlestick Data Collector - Ultra Optimized Version
 Fetches 5min and 15min candlestick data and stores in PostgreSQL database.
 Optimized for processing large numbers of symbols quickly using parallel processing and batch operations.
 
-RVOL Implementation (15-minute candles):
-- slot_index: 0-25 mapping to 15-minute slots from 09:30-16:00 ET
+RVOL Implementation (5-minute and 15-minute candles):
+
+5-minute candles:
+- slot_index: 0-77 mapping to 5-minute slots from 09:30-16:00 ET (78 slots)
+- cum_volume: cumulative volume within session
+
+15-minute candles:
+- slot_index: 0-25 mapping to 15-minute slots from 09:30-16:00 ET (26 slots)
 - cum_volume: cumulative volume within session
 
 Slot RVOL:
@@ -28,7 +34,7 @@ NOTE: All timestamps are stored in UTC format. Slot index calculations are done
       internally using ET conversion but timestamps remain in UTC.
 """
 
-from alpaca.data import TimeFrameUnit
+from alpaca.data import TimeFrameUnit, Adjustment
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -80,6 +86,10 @@ DB_BATCH_SIZE = 100
 RVOL_LOOKBACK_SESSIONS = 20
 RVOL_MIN_SESSIONS = 5  # require at least 5 sessions for valid baseline
 RVOL_MIN_BASELINE_VOLUME = 100  # minimum baseline volume to compute RVOL (absolute floor)
+
+# Slot counts for different timeframes
+SLOTS_5MIN = 78  # 6.5 hours * 12 slots/hour
+SLOTS_15MIN = 26  # 6.5 hours * 4 slots/hour
 
 # Set up logging
 logging.basicConfig(
@@ -229,7 +239,7 @@ class AlpacaDataCollectorOptimized:
         cur = conn.cursor()
 
         try:
-            # candles_5min
+            # candles_5min with RVOL fields
             cur.execute("""
                         CREATE TABLE IF NOT EXISTS candles_5min
                         (
@@ -281,6 +291,38 @@ class AlpacaDataCollectorOptimized:
                             ema_39
                             DOUBLE
                             PRECISION,
+
+                            -- Slot RVOL
+                            slot_index
+                            SMALLINT,
+                            cum_volume
+                            BIGINT,
+                            rvol_slot_20
+                            DOUBLE
+                            PRECISION,
+                            rvol_slot_baseline_20
+                            DOUBLE
+                            PRECISION,
+
+                            -- Cumulative RVOL
+                            rvol_cum_20
+                            DOUBLE
+                            PRECISION,
+                            rvol_cum_baseline_20
+                            DOUBLE
+                            PRECISION,
+
+                            -- Intraday RVOL (projected EOD)
+                            intraday_rvol_20
+                            DOUBLE
+                            PRECISION,
+                            avg_daily_volume_20
+                            DOUBLE
+                            PRECISION,
+                            pct_of_day_typical
+                            DOUBLE
+                            PRECISION,
+
                             created_at
                             TIMESTAMP
                             DEFAULT
@@ -292,6 +334,21 @@ class AlpacaDataCollectorOptimized:
                         )
                             );
                         """)
+
+            # Add RVOL columns to candles_5min if table already exists
+            new_columns_5min = [
+                ("slot_index", "SMALLINT"),
+                ("cum_volume", "BIGINT"),
+                ("rvol_slot_20", "DOUBLE PRECISION"),
+                ("rvol_slot_baseline_20", "DOUBLE PRECISION"),
+                ("rvol_cum_20", "DOUBLE PRECISION"),
+                ("rvol_cum_baseline_20", "DOUBLE PRECISION"),
+                ("intraday_rvol_20", "DOUBLE PRECISION"),
+                ("avg_daily_volume_20", "DOUBLE PRECISION"),
+                ("pct_of_day_typical", "DOUBLE PRECISION"),
+            ]
+            for col_name, col_type in new_columns_5min:
+                cur.execute(f"ALTER TABLE candles_5min ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
 
             # candles_15min with RVOL fields
             cur.execute("""
@@ -389,8 +446,8 @@ class AlpacaDataCollectorOptimized:
                             );
                         """)
 
-            # Add columns if table already exists
-            new_columns = [
+            # Add columns to candles_15min if table already exists
+            new_columns_15min = [
                 ("slot_index", "SMALLINT"),
                 ("cum_volume", "BIGINT"),
                 ("rvol_slot_20", "DOUBLE PRECISION"),
@@ -401,7 +458,7 @@ class AlpacaDataCollectorOptimized:
                 ("avg_daily_volume_20", "DOUBLE PRECISION"),
                 ("pct_of_day_typical", "DOUBLE PRECISION"),
             ]
-            for col_name, col_type in new_columns:
+            for col_name, col_type in new_columns_15min:
                 cur.execute(f"ALTER TABLE candles_15min ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
 
             # daily_bars
@@ -545,7 +602,9 @@ class AlpacaDataCollectorOptimized:
 
             # Indexes
             cur.execute("CREATE INDEX IF NOT EXISTS idx_5min_symbol_timestamp ON candles_5min(symbol, timestamp);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_5min_symbol_slot ON candles_5min(symbol, slot_index);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_15min_symbol_timestamp ON candles_15min(symbol, timestamp);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_15min_symbol_slot ON candles_15min(symbol, slot_index);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_daily_symbol_timestamp ON daily_bars(symbol, timestamp);")
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_csp_symbol_date ON composite_session_profiles(symbol, session_date);")
@@ -588,14 +647,20 @@ class AlpacaDataCollectorOptimized:
         return MARKET_START_PST <= hour_decimal <= MARKET_END_PST
 
     # -----------------------------------------------------------------------
-    # RVOL Implementation
+    # RVOL Implementation (Generalized for 5min and 15min)
     # -----------------------------------------------------------------------
 
-    def _compute_slot_index_from_utc(self, ts: pd.Timestamp) -> Optional[int]:
+    def _compute_slot_index_from_utc(self, ts: pd.Timestamp, interval_minutes: int = 15) -> Optional[int]:
         """
-        Compute slot_index for regular session (09:30-16:00 ET) in 15m increments.
+        Compute slot_index for regular session (09:30-16:00 ET).
         Input timestamp is in UTC, converts to ET for slot calculation.
-        Returns 0..25, or None if outside regular session.
+
+        Args:
+            ts: Timestamp in UTC
+            interval_minutes: 5 or 15 for the candle interval
+
+        Returns:
+            slot_index (0-77 for 5min, 0-25 for 15min), or None if outside regular session.
         """
         # Convert UTC to ET for slot calculation
         if ts.tzinfo is None:
@@ -615,7 +680,7 @@ class AlpacaDataCollectorOptimized:
         if total_min < start or total_min >= end:
             return None
 
-        return int((total_min - start) // 15)
+        return int((total_min - start) // interval_minutes)
 
     def _get_session_date_from_utc(self, ts: pd.Timestamp) -> date:
         """
@@ -630,13 +695,14 @@ class AlpacaDataCollectorOptimized:
         ts_et = ts_utc.astimezone(self.est_tz)
         return ts_et.date()
 
-    def calculate_rvol_15m(
+    def calculate_rvol(
             self,
             df: pd.DataFrame,
+            interval_minutes: int,
             lookback_sessions: int = RVOL_LOOKBACK_SESSIONS
     ) -> pd.DataFrame:
         """
-        Calculate all three RVOL variants for 15-minute data:
+        Calculate all three RVOL variants for intraday data (5min or 15min):
 
         1. Slot RVOL: volume at this slot / median volume at same slot over N prior sessions
         2. Cumulative RVOL: cum volume at slot / median cum volume at same slot over N prior sessions
@@ -645,10 +711,21 @@ class AlpacaDataCollectorOptimized:
         Uses MEDIAN for slot/cum baselines to reduce sensitivity to outlier days (earnings, news).
         Baselines exclude current session (shift by 1).
 
+        Args:
+            df: DataFrame with timestamp, volume columns
+            interval_minutes: 5 or 15 for the candle interval
+            lookback_sessions: Number of prior sessions for baseline calculation
+
+        Returns:
+            DataFrame with RVOL columns added
+
         IMPORTANT: Timestamps remain in UTC. Slot calculations use ET internally.
         """
         if df.empty:
             return df
+
+        # Determine number of slots based on interval
+        num_slots = SLOTS_5MIN if interval_minutes == 5 else SLOTS_15MIN
 
         df = df.copy()
         df = df.sort_values("timestamp").reset_index(drop=True)
@@ -663,8 +740,10 @@ class AlpacaDataCollectorOptimized:
         # Compute session date (in ET) for each row - used for grouping only
         df["_session_date"] = df["timestamp"].apply(self._get_session_date_from_utc)
 
-        # Slot index 0..25 (computed from UTC -> ET conversion)
-        df["slot_index"] = df["timestamp"].apply(self._compute_slot_index_from_utc)
+        # Slot index (computed from UTC -> ET conversion)
+        df["slot_index"] = df["timestamp"].apply(
+            lambda ts: self._compute_slot_index_from_utc(ts, interval_minutes)
+        )
 
         # Keep only regular session slots
         df = df[df["slot_index"].notna()].copy()
@@ -691,7 +770,7 @@ class AlpacaDataCollectorOptimized:
         # 1. SLOT RVOL (using median)
         # -----------------------------------------------------------------
         slot_baselines = []
-        for slot in range(26):
+        for slot in range(num_slots):
             slot_df = df[df["slot_index"] == slot][["_session_date", "_session_idx", "volume"]].drop_duplicates(
                 "_session_date")
             slot_df = slot_df.sort_values("_session_idx").reset_index(drop=True)
@@ -725,7 +804,7 @@ class AlpacaDataCollectorOptimized:
         # 2. CUMULATIVE RVOL (using median)
         # -----------------------------------------------------------------
         cum_baselines = []
-        for slot in range(26):
+        for slot in range(num_slots):
             slot_df = df[df["slot_index"] == slot][["_session_date", "_session_idx", "cum_volume"]].drop_duplicates(
                 "_session_date")
             slot_df = slot_df.sort_values("_session_idx").reset_index(drop=True)
@@ -781,7 +860,7 @@ class AlpacaDataCollectorOptimized:
 
         # Compute typical % at each slot (median across prior sessions)
         pct_baselines = []
-        for slot in range(26):
+        for slot in range(num_slots):
             slot_df = df[df["slot_index"] == slot][
                 ["_session_date", "_session_idx", "_pct_of_day_actual"]].drop_duplicates("_session_date")
             slot_df = slot_df.sort_values("_session_idx").reset_index(drop=True)
@@ -839,6 +918,28 @@ class AlpacaDataCollectorOptimized:
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         return df
+
+    def calculate_rvol_5m(
+            self,
+            df: pd.DataFrame,
+            lookback_sessions: int = RVOL_LOOKBACK_SESSIONS
+    ) -> pd.DataFrame:
+        """
+        Calculate RVOL for 5-minute candles.
+        Convenience wrapper around calculate_rvol.
+        """
+        return self.calculate_rvol(df, interval_minutes=5, lookback_sessions=lookback_sessions)
+
+    def calculate_rvol_15m(
+            self,
+            df: pd.DataFrame,
+            lookback_sessions: int = RVOL_LOOKBACK_SESSIONS
+    ) -> pd.DataFrame:
+        """
+        Calculate RVOL for 15-minute candles.
+        Convenience wrapper around calculate_rvol.
+        """
+        return self.calculate_rvol(df, interval_minutes=15, lookback_sessions=lookback_sessions)
 
     # -----------------------------------------------------------------------
     # Indicator calculations
@@ -1033,6 +1134,7 @@ class AlpacaDataCollectorOptimized:
             timeframe=TimeFrame(1, TimeFrameUnit.Minute),
             start=session_start.isoformat(),
             end=session_end.isoformat(),
+            adjustment=Adjustment.ALL
         )
 
         try:
@@ -1354,7 +1456,7 @@ class AlpacaDataCollectorOptimized:
                 start=start_date.isoformat(),
                 end=end_date.isoformat(),
                 feed="iex",
-            )
+                adjustment=Adjustment.ALL            )
 
             self.api_call_count += 1
             bars = self.client.get_stock_bars(request)
@@ -1469,7 +1571,7 @@ class AlpacaDataCollectorOptimized:
             timeframe=timeframe,
             start=start_date.isoformat(),
             end=end_date.isoformat(),
-        )
+            adjustment=Adjustment.ALL        )
 
         try:
             self.api_call_count += 1
@@ -1492,10 +1594,17 @@ class AlpacaDataCollectorOptimized:
             market_hours_df = self.calculate_vwap_series(market_hours_df)
             market_hours_df = self.calculate_ema_series(market_hours_df, [8, 20, 39])
 
-            # RVOL fields only for 15m
-            if timeframe.amount == 15 and timeframe.unit == TimeFrameUnit.Minute:
+            # Determine interval for RVOL calculation
+            is_5min = timeframe.amount == 5 and timeframe.unit == TimeFrameUnit.Minute
+            is_15min = timeframe.amount == 15 and timeframe.unit == TimeFrameUnit.Minute
+
+            # Calculate RVOL for both 5min and 15min candles
+            if is_5min:
+                market_hours_df = self.calculate_rvol_5m(market_hours_df, lookback_sessions=RVOL_LOOKBACK_SESSIONS)
+            elif is_15min:
                 market_hours_df = self.calculate_rvol_15m(market_hours_df, lookback_sessions=RVOL_LOOKBACK_SESSIONS)
 
+            # Base columns for all timeframes
             available_columns = [
                 "symbol",
                 "timestamp",
@@ -1510,7 +1619,8 @@ class AlpacaDataCollectorOptimized:
                 "ema_39",
             ]
 
-            if timeframe.amount == 15 and timeframe.unit == TimeFrameUnit.Minute:
+            # RVOL columns for both 5min and 15min
+            if is_5min or is_15min:
                 available_columns += [
                     "slot_index",
                     "cum_volume",
@@ -1734,7 +1844,7 @@ class AlpacaDataCollectorOptimized:
             daily_bars_batch = self.process_symbol_batch(batch, days_back)
             self.batch_store_daily_bars(daily_bars_batch)
 
-            # Fetch & store 5min candles
+            # Fetch & store 5min candles (now includes RVOL fields)
             data_5min = self.get_market_hours_data_batch(
                 batch, TimeFrame(5, TimeFrameUnit.Minute), days_back=days_back
             )
@@ -1792,6 +1902,29 @@ class AlpacaDataCollectorOptimized:
                 print(f"  Total Records: {total_records}")
                 print(f"  Date Range: {earliest} to {latest}")
 
+            # RVOL quality check for 5min
+            cur.execute("""
+                        SELECT COUNT(*)                                                                     as total_rows,
+                               COUNT(rvol_slot_20)                                                          as slot_rvol_populated,
+                               COUNT(rvol_cum_20)                                                           as cum_rvol_populated,
+                               COUNT(intraday_rvol_20)                                                      as intraday_rvol_populated,
+                               ROUND(AVG(rvol_slot_20)::numeric, 2)                                         as avg_slot_rvol,
+                               ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rvol_slot_20)::numeric, 2) as median_slot_rvol,
+                               ROUND(AVG(intraday_rvol_20)::numeric, 2)                                     as avg_intraday_rvol
+                        FROM candles_5min
+                        WHERE timestamp > CURRENT_DATE - INTERVAL '30 days'
+                        """)
+            row = cur.fetchone()
+            if row:
+                print(f"\nRVOL Quality - candles_5min (last 30 days):")
+                print(f"  Total rows: {row[0]}")
+                print(f"  Slot RVOL populated: {row[1]} ({100 * row[1] / max(row[0], 1):.1f}%)")
+                print(f"  Cum RVOL populated: {row[2]} ({100 * row[2] / max(row[0], 1):.1f}%)")
+                print(f"  Intraday RVOL populated: {row[3]} ({100 * row[3] / max(row[0], 1):.1f}%)")
+                print(f"  Avg Slot RVOL: {row[4]}")
+                print(f"  Median Slot RVOL: {row[5]}")
+                print(f"  Avg Intraday RVOL: {row[6]}")
+
             # RVOL quality check for 15min
             cur.execute("""
                         SELECT COUNT(*)                                                                     as total_rows,
@@ -1806,7 +1939,7 @@ class AlpacaDataCollectorOptimized:
                         """)
             row = cur.fetchone()
             if row:
-                print(f"\nRVOL Quality (last 30 days):")
+                print(f"\nRVOL Quality - candles_15min (last 30 days):")
                 print(f"  Total rows: {row[0]}")
                 print(f"  Slot RVOL populated: {row[1]} ({100 * row[1] / max(row[0], 1):.1f}%)")
                 print(f"  Cum RVOL populated: {row[2]} ({100 * row[2] / max(row[0], 1):.1f}%)")
