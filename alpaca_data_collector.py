@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 Alpaca Candlestick Data Collector - Ultra Optimized Version
-Fetches 5min and 15min candlestick data and stores in PostgreSQL database.
-Optimized for processing large numbers of symbols quickly using parallel processing and batch operations.
+Fetches 5min, 15min, and 1min (first hour) candlestick data and stores in PostgreSQL database.
+
+NEW: First Hour 1-Minute Candles (candles_1min_first_hour)
+- Captures 9:30-10:30 AM ET (60 one-minute bars)
+- slot_index: 0-59 mapping to each minute of the first hour
+- Includes RVOL calculations and EMA indicators
+- Critical for Initial Balance (IB) analysis and early session momentum
 
 RVOL Implementation (5-minute and 15-minute candles):
 
@@ -14,6 +19,10 @@ RVOL Implementation (5-minute and 15-minute candles):
 - slot_index: 0-25 mapping to 15-minute slots from 09:30-16:00 ET (26 slots)
 - cum_volume: cumulative volume within session
 
+1-minute first hour candles:
+- slot_index: 0-59 mapping to 1-minute slots from 09:30-10:30 ET (60 slots)
+- cum_volume: cumulative volume within first hour
+
 Slot RVOL:
 - rvol_slot_20: current slot volume / baseline (median of same slot over prior 20 sessions)
 - rvol_slot_baseline_20: the baseline value used
@@ -22,13 +31,20 @@ Cumulative RVOL:
 - rvol_cum_20: current cumulative volume / baseline cumulative at same slot
 - rvol_cum_baseline_20: the baseline value used
 
-Intraday RVOL (projected EOD):
-- intraday_rvol_20: projected EOD volume / average daily volume
-- avg_daily_volume_20: average full-day volume over prior 20 sessions
-- pct_of_day_typical: typical % of daily volume completed by this slot
-
 All baselines use MEDIAN (not mean) to reduce sensitivity to earnings/news spikes.
 Baselines exclude current session (shift by 1).
+
+Daily Bars Indicators:
+- ema_8, ema_20, ema_39, ema_50: Exponential Moving Averages
+- ema_39_slope, ema_50_slope: 3-day slope of EMAs
+- adx: Average Directional Index (14-period, Wilder smoothing)
+- adx_sma: SMA of ADX (5-period) for trend strength smoothing
+- adx_slope: 3-day slope of ADX
+- di_plus, di_minus: Directional Indicators (+DI/-DI)
+
+Intraday Candles (5min/15min/1min) Indicators:
+- ema_8, ema_20, ema_39, ema_50: Exponential Moving Averages
+- ema_39_slope, ema_50_slope: 3-bar slope of EMAs
 
 NOTE: All timestamps are stored in UTC format. Slot index calculations are done
       internally using ET conversion but timestamps remain in UTC.
@@ -77,6 +93,10 @@ MAX_BARS = 30000
 MARKET_START_PST = 6.5  # 6:30 AM PST
 MARKET_END_PST = 12.99  # 1:00 PM PST
 
+# First hour window (ET)
+FIRST_HOUR_START_MINUTES = 9 * 60 + 30  # 9:30 AM ET = 570 minutes
+FIRST_HOUR_END_MINUTES = 10 * 60 + 30  # 10:30 AM ET = 630 minutes
+
 # Optimization parameters
 MAX_WORKERS = 20
 BATCH_SIZE = 10
@@ -90,6 +110,7 @@ RVOL_MIN_BASELINE_VOLUME = 100  # minimum baseline volume to compute RVOL (absol
 # Slot counts for different timeframes
 SLOTS_5MIN = 78  # 6.5 hours * 12 slots/hour
 SLOTS_15MIN = 26  # 6.5 hours * 4 slots/hour
+SLOTS_1MIN_FIRST_HOUR = 60  # 60 minutes in first hour
 
 # Set up logging
 logging.basicConfig(
@@ -239,7 +260,7 @@ class AlpacaDataCollectorOptimized:
         cur = conn.cursor()
 
         try:
-            # candles_5min with RVOL fields
+            # candles_5min with RVOL fields and TrendEngine fields
             cur.execute("""
                         CREATE TABLE IF NOT EXISTS candles_5min
                         (
@@ -291,8 +312,6 @@ class AlpacaDataCollectorOptimized:
                             ema_39
                             DOUBLE
                             PRECISION,
-
-                            -- Slot RVOL
                             slot_index
                             SMALLINT,
                             cum_volume
@@ -303,16 +322,12 @@ class AlpacaDataCollectorOptimized:
                             rvol_slot_baseline_20
                             DOUBLE
                             PRECISION,
-
-                            -- Cumulative RVOL
                             rvol_cum_20
                             DOUBLE
                             PRECISION,
                             rvol_cum_baseline_20
                             DOUBLE
                             PRECISION,
-
-                            -- Intraday RVOL (projected EOD)
                             intraday_rvol_20
                             DOUBLE
                             PRECISION,
@@ -322,7 +337,6 @@ class AlpacaDataCollectorOptimized:
                             pct_of_day_typical
                             DOUBLE
                             PRECISION,
-
                             created_at
                             TIMESTAMP
                             DEFAULT
@@ -335,7 +349,7 @@ class AlpacaDataCollectorOptimized:
                             );
                         """)
 
-            # Add RVOL columns to candles_5min if table already exists
+            # Add RVOL columns and TrendEngine columns to candles_5min if table already exists
             new_columns_5min = [
                 ("slot_index", "SMALLINT"),
                 ("cum_volume", "BIGINT"),
@@ -346,11 +360,14 @@ class AlpacaDataCollectorOptimized:
                 ("intraday_rvol_20", "DOUBLE PRECISION"),
                 ("avg_daily_volume_20", "DOUBLE PRECISION"),
                 ("pct_of_day_typical", "DOUBLE PRECISION"),
+                ("ema_50", "DOUBLE PRECISION"),
+                ("ema_39_slope", "DOUBLE PRECISION"),
+                ("ema_50_slope", "DOUBLE PRECISION"),
             ]
             for col_name, col_type in new_columns_5min:
                 cur.execute(f"ALTER TABLE candles_5min ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
 
-            # candles_15min with RVOL fields
+            # candles_15min with RVOL fields and TrendEngine fields
             cur.execute("""
                         CREATE TABLE IF NOT EXISTS candles_15min
                         (
@@ -402,8 +419,126 @@ class AlpacaDataCollectorOptimized:
                             ema_39
                             DOUBLE
                             PRECISION,
+                            slot_index
+                            SMALLINT,
+                            cum_volume
+                            BIGINT,
+                            rvol_slot_20
+                            DOUBLE
+                            PRECISION,
+                            rvol_slot_baseline_20
+                            DOUBLE
+                            PRECISION,
+                            rvol_cum_20
+                            DOUBLE
+                            PRECISION,
+                            rvol_cum_baseline_20
+                            DOUBLE
+                            PRECISION,
+                            intraday_rvol_20
+                            DOUBLE
+                            PRECISION,
+                            avg_daily_volume_20
+                            DOUBLE
+                            PRECISION,
+                            pct_of_day_typical
+                            DOUBLE
+                            PRECISION,
+                            created_at
+                            TIMESTAMP
+                            DEFAULT
+                            CURRENT_TIMESTAMP,
+                            UNIQUE
+                        (
+                            symbol,
+                            timestamp
+                        )
+                            );
+                        """)
 
-                            -- Slot RVOL
+            # Add columns to candles_15min if table already exists (including TrendEngine)
+            new_columns_15min = [
+                ("slot_index", "SMALLINT"),
+                ("cum_volume", "BIGINT"),
+                ("rvol_slot_20", "DOUBLE PRECISION"),
+                ("rvol_slot_baseline_20", "DOUBLE PRECISION"),
+                ("rvol_cum_20", "DOUBLE PRECISION"),
+                ("rvol_cum_baseline_20", "DOUBLE PRECISION"),
+                ("intraday_rvol_20", "DOUBLE PRECISION"),
+                ("avg_daily_volume_20", "DOUBLE PRECISION"),
+                ("pct_of_day_typical", "DOUBLE PRECISION"),
+                ("ema_50", "DOUBLE PRECISION"),
+                ("ema_39_slope", "DOUBLE PRECISION"),
+                ("ema_50_slope", "DOUBLE PRECISION"),
+            ]
+            for col_name, col_type in new_columns_15min:
+                cur.execute(f"ALTER TABLE candles_15min ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
+
+            # NEW: candles_1min_first_hour - First hour 1-minute candles
+            cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candles_1min_first_hour
+                        (
+                            id
+                            SERIAL
+                            PRIMARY
+                            KEY,
+                            symbol
+                            TEXT
+                            NOT
+                            NULL,
+                            timestamp
+                            TIMESTAMP
+                            NOT
+                            NULL,
+                            open
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            high
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            low
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            close
+                            DOUBLE
+                            PRECISION
+                            NOT
+                            NULL,
+                            volume
+                            BIGINT
+                            NOT
+                            NULL,
+                            vwap
+                            DOUBLE
+                            PRECISION,
+
+                            -- EMAs
+                            ema_8
+                            DOUBLE
+                            PRECISION,
+                            ema_20
+                            DOUBLE
+                            PRECISION,
+                            ema_39
+                            DOUBLE
+                            PRECISION,
+                            ema_50
+                            DOUBLE
+                            PRECISION,
+                            ema_39_slope
+                            DOUBLE
+                            PRECISION,
+                            ema_50_slope
+                            DOUBLE
+                            PRECISION,
+
+                            -- Slot RVOL (within first hour context)
                             slot_index
                             SMALLINT,
                             cum_volume
@@ -415,7 +550,7 @@ class AlpacaDataCollectorOptimized:
                             DOUBLE
                             PRECISION,
 
-                            -- Cumulative RVOL
+                            -- Cumulative RVOL (within first hour)
                             rvol_cum_20
                             DOUBLE
                             PRECISION,
@@ -423,14 +558,14 @@ class AlpacaDataCollectorOptimized:
                             DOUBLE
                             PRECISION,
 
-                            -- Intraday RVOL (projected EOD)
-                            intraday_rvol_20
+                            -- Initial Balance metrics (computed at end of first hour)
+                            ib_high
                             DOUBLE
                             PRECISION,
-                            avg_daily_volume_20
+                            ib_low
                             DOUBLE
                             PRECISION,
-                            pct_of_day_typical
+                            ib_range
                             DOUBLE
                             PRECISION,
 
@@ -446,22 +581,7 @@ class AlpacaDataCollectorOptimized:
                             );
                         """)
 
-            # Add columns to candles_15min if table already exists
-            new_columns_15min = [
-                ("slot_index", "SMALLINT"),
-                ("cum_volume", "BIGINT"),
-                ("rvol_slot_20", "DOUBLE PRECISION"),
-                ("rvol_slot_baseline_20", "DOUBLE PRECISION"),
-                ("rvol_cum_20", "DOUBLE PRECISION"),
-                ("rvol_cum_baseline_20", "DOUBLE PRECISION"),
-                ("intraday_rvol_20", "DOUBLE PRECISION"),
-                ("avg_daily_volume_20", "DOUBLE PRECISION"),
-                ("pct_of_day_typical", "DOUBLE PRECISION"),
-            ]
-            for col_name, col_type in new_columns_15min:
-                cur.execute(f"ALTER TABLE candles_15min ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
-
-            # daily_bars
+            # daily_bars with TrendEngine fields
             cur.execute("""
                         CREATE TABLE IF NOT EXISTS daily_bars
                         (
@@ -549,6 +669,21 @@ class AlpacaDataCollectorOptimized:
                             );
                         """)
 
+            # Add new daily_bars columns for TrendEngine (EMA39, EMA50, ADX, DI+/DI-, slopes)
+            new_daily_columns = [
+                ("ema_39", "DOUBLE PRECISION"),
+                ("ema_50", "DOUBLE PRECISION"),
+                ("ema_39_slope", "DOUBLE PRECISION"),
+                ("ema_50_slope", "DOUBLE PRECISION"),
+                ("adx", "DOUBLE PRECISION"),
+                ("adx_sma", "DOUBLE PRECISION"),
+                ("adx_slope", "DOUBLE PRECISION"),
+                ("di_plus", "DOUBLE PRECISION"),
+                ("di_minus", "DOUBLE PRECISION"),
+            ]
+            for col_name, col_type in new_daily_columns:
+                cur.execute(f"ALTER TABLE daily_bars ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
+
             # composite_session_profiles
             cur.execute("""
                         CREATE TABLE IF NOT EXISTS composite_session_profiles
@@ -609,6 +744,12 @@ class AlpacaDataCollectorOptimized:
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_csp_symbol_date ON composite_session_profiles(symbol, session_date);")
 
+            # NEW: Indexes for first hour candles
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_1min_fh_symbol_timestamp ON candles_1min_first_hour(symbol, timestamp);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_1min_fh_symbol_slot ON candles_1min_first_hour(symbol, slot_index);")
+
             conn.commit()
             logging.info("Postgres database setup completed")
 
@@ -646,8 +787,18 @@ class AlpacaDataCollectorOptimized:
 
         return MARKET_START_PST <= hour_decimal <= MARKET_END_PST
 
+    def is_first_hour(self, timestamp: datetime) -> bool:
+        """Check if timestamp is within first hour (9:30-10:30 AM ET)."""
+        if timestamp.tzinfo is None:
+            timestamp = self.utc_tz.localize(timestamp)
+
+        et_time = timestamp.astimezone(self.est_tz)
+        total_minutes = et_time.hour * 60 + et_time.minute
+
+        return FIRST_HOUR_START_MINUTES <= total_minutes < FIRST_HOUR_END_MINUTES
+
     # -----------------------------------------------------------------------
-    # RVOL Implementation (Generalized for 5min and 15min)
+    # RVOL Implementation (Generalized for 5min, 15min, and 1min first hour)
     # -----------------------------------------------------------------------
 
     def _compute_slot_index_from_utc(self, ts: pd.Timestamp, interval_minutes: int = 15) -> Optional[int]:
@@ -681,6 +832,30 @@ class AlpacaDataCollectorOptimized:
             return None
 
         return int((total_min - start) // interval_minutes)
+
+    def _compute_first_hour_slot_index(self, ts: pd.Timestamp) -> Optional[int]:
+        """
+        Compute slot_index for first hour (09:30-10:30 ET).
+        Returns 0-59 for the 60 one-minute slots.
+
+        Args:
+            ts: Timestamp in UTC
+
+        Returns:
+            slot_index (0-59), or None if outside first hour.
+        """
+        if ts.tzinfo is None:
+            ts_utc = self.utc_tz.localize(ts.to_pydatetime())
+        else:
+            ts_utc = ts.to_pydatetime()
+
+        ts_et = ts_utc.astimezone(self.est_tz)
+        total_min = ts_et.hour * 60 + ts_et.minute
+
+        if total_min < FIRST_HOUR_START_MINUTES or total_min >= FIRST_HOUR_END_MINUTES:
+            return None
+
+        return int(total_min - FIRST_HOUR_START_MINUTES)
 
     def _get_session_date_from_utc(self, ts: pd.Timestamp) -> date:
         """
@@ -793,7 +968,7 @@ class AlpacaDataCollectorOptimized:
         # Apply minimum baseline floor
         df["rvol_slot_baseline_20"] = df["rvol_slot_baseline_20"].clip(lower=RVOL_MIN_BASELINE_VOLUME)
 
-        # Compute slot RVOL
+        # Calculate slot RVOL
         df["rvol_slot_20"] = np.where(
             df["rvol_slot_baseline_20"].notna() & (df["rvol_slot_baseline_20"] > 0),
             df["volume"] / df["rvol_slot_baseline_20"],
@@ -915,6 +1090,151 @@ class AlpacaDataCollectorOptimized:
         df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors="ignore")
 
         # Restore original sort by timestamp
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        return df
+
+    def calculate_rvol_first_hour(
+            self,
+            df: pd.DataFrame,
+            lookback_sessions: int = RVOL_LOOKBACK_SESSIONS
+    ) -> pd.DataFrame:
+        """
+        Calculate RVOL for first hour 1-minute candles.
+
+        1. Slot RVOL: volume at this minute / median volume at same minute over N prior sessions
+        2. Cumulative RVOL: cum volume at minute / median cum volume at same minute over N prior sessions
+
+        Args:
+            df: DataFrame with timestamp, volume columns (1-minute first hour data)
+            lookback_sessions: Number of prior sessions for baseline calculation
+
+        Returns:
+            DataFrame with RVOL columns and IB metrics added
+        """
+        if df.empty:
+            return df
+
+        num_slots = SLOTS_1MIN_FIRST_HOUR  # 60 slots
+
+        df = df.copy()
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+        # Ensure timestamps are UTC
+        if df["timestamp"].dt.tz is None:
+            df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
+        else:
+            df["timestamp"] = df["timestamp"].dt.tz_convert("UTC")
+
+        # Compute session date for grouping
+        df["_session_date"] = df["timestamp"].apply(self._get_session_date_from_utc)
+
+        # Slot index (0-59 for first hour)
+        df["slot_index"] = df["timestamp"].apply(self._compute_first_hour_slot_index)
+
+        # Keep only first hour slots
+        df = df[df["slot_index"].notna()].copy()
+        if df.empty:
+            return df
+
+        df["slot_index"] = df["slot_index"].astype(int)
+
+        # Cumulative volume within first hour
+        df = df.sort_values(["_session_date", "timestamp"]).reset_index(drop=True)
+        df["cum_volume"] = df.groupby("_session_date")["volume"].cumsum()
+
+        # Get unique sessions in order
+        sessions = sorted(df["_session_date"].unique())
+        session_to_idx = {s: i for i, s in enumerate(sessions)}
+        df["_session_idx"] = df["_session_date"].map(session_to_idx)
+
+        # -----------------------------------------------------------------
+        # 1. SLOT RVOL (using median)
+        # -----------------------------------------------------------------
+        slot_baselines = []
+        for slot in range(num_slots):
+            slot_df = df[df["slot_index"] == slot][["_session_date", "_session_idx", "volume"]].drop_duplicates(
+                "_session_date")
+            slot_df = slot_df.sort_values("_session_idx").reset_index(drop=True)
+
+            slot_df["baseline"] = (
+                slot_df["volume"]
+                .shift(1)
+                .rolling(window=lookback_sessions, min_periods=RVOL_MIN_SESSIONS)
+                .median()
+            )
+            slot_df["slot_index"] = slot
+            slot_baselines.append(slot_df[["_session_date", "slot_index", "baseline"]])
+
+        slot_baseline_df = pd.concat(slot_baselines, ignore_index=True)
+        slot_baseline_df.columns = ["_session_date", "slot_index", "rvol_slot_baseline_20"]
+
+        df = df.merge(slot_baseline_df, on=["_session_date", "slot_index"], how="left")
+        df["rvol_slot_baseline_20"] = df["rvol_slot_baseline_20"].clip(lower=RVOL_MIN_BASELINE_VOLUME)
+
+        df["rvol_slot_20"] = np.where(
+            df["rvol_slot_baseline_20"].notna() & (df["rvol_slot_baseline_20"] > 0),
+            df["volume"] / df["rvol_slot_baseline_20"],
+            np.nan
+        )
+
+        # -----------------------------------------------------------------
+        # 2. CUMULATIVE RVOL (using median)
+        # -----------------------------------------------------------------
+        cum_baselines = []
+        for slot in range(num_slots):
+            slot_df = df[df["slot_index"] == slot][["_session_date", "_session_idx", "cum_volume"]].drop_duplicates(
+                "_session_date")
+            slot_df = slot_df.sort_values("_session_idx").reset_index(drop=True)
+
+            slot_df["baseline"] = (
+                slot_df["cum_volume"]
+                .shift(1)
+                .rolling(window=lookback_sessions, min_periods=RVOL_MIN_SESSIONS)
+                .median()
+            )
+            slot_df["slot_index"] = slot
+            cum_baselines.append(slot_df[["_session_date", "slot_index", "baseline"]])
+
+        cum_baseline_df = pd.concat(cum_baselines, ignore_index=True)
+        cum_baseline_df.columns = ["_session_date", "slot_index", "rvol_cum_baseline_20"]
+
+        df = df.merge(cum_baseline_df, on=["_session_date", "slot_index"], how="left")
+        df["rvol_cum_baseline_20"] = df["rvol_cum_baseline_20"].clip(lower=RVOL_MIN_BASELINE_VOLUME)
+
+        df["rvol_cum_20"] = np.where(
+            df["rvol_cum_baseline_20"].notna() & (df["rvol_cum_baseline_20"] > 0),
+            df["cum_volume"] / df["rvol_cum_baseline_20"],
+            np.nan
+        )
+
+        # -----------------------------------------------------------------
+        # 3. Initial Balance (IB) metrics - computed per session
+        # -----------------------------------------------------------------
+        ib_stats = df.groupby("_session_date").agg(
+            ib_high=("high", "max"),
+            ib_low=("low", "min")
+        ).reset_index()
+        ib_stats["ib_range"] = ib_stats["ib_high"] - ib_stats["ib_low"]
+
+        df = df.merge(ib_stats, on="_session_date", how="left")
+
+        # -----------------------------------------------------------------
+        # Round and clean up
+        # -----------------------------------------------------------------
+        df["rvol_slot_20"] = df["rvol_slot_20"].round(4)
+        df["rvol_cum_20"] = df["rvol_cum_20"].round(4)
+        df["rvol_slot_baseline_20"] = df["rvol_slot_baseline_20"].round(2)
+        df["rvol_cum_baseline_20"] = df["rvol_cum_baseline_20"].round(2)
+        df["ib_high"] = df["ib_high"].round(2)
+        df["ib_low"] = df["ib_low"].round(2)
+        df["ib_range"] = df["ib_range"].round(2)
+
+        # Drop intermediate columns
+        cols_to_drop = ["_session_idx", "_session_date"]
+        df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors="ignore")
+
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         return df
@@ -1067,6 +1387,151 @@ class AlpacaDataCollectorOptimized:
 
         return df
 
+    def calculate_adx_daily(
+            self,
+            df: pd.DataFrame,
+            length: int = 14,
+            avg_length: int = 5
+    ) -> pd.DataFrame:
+        """
+        Calculate DI+, DI-, ADX, and SMA(ADX) using Wilder-style smoothing for daily bars.
+        """
+        if df.empty or len(df) < 2:
+            df["di_plus"] = np.nan
+            df["di_minus"] = np.nan
+            df["adx"] = np.nan
+            df["adx_sma"] = np.nan
+            return df
+
+        df = df.copy()
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        n = len(df)
+
+        di_plus_arr = np.full(n, np.nan)
+        di_minus_arr = np.full(n, np.nan)
+        adx_arr = np.full(n, np.nan)
+        adx_sma_arr = np.full(n, np.nan)
+
+        smoothed_tr = 0.0
+        smoothed_dm_plus = 0.0
+        smoothed_dm_minus = 0.0
+
+        dx_values = []
+        valid_adx_values = []
+
+        for i in range(n):
+            if i == 0:
+                continue
+
+            high = df["high"].iloc[i]
+            low = df["low"].iloc[i]
+            prev_high = df["high"].iloc[i - 1]
+            prev_low = df["low"].iloc[i - 1]
+            prev_close = df["close"].iloc[i - 1]
+
+            tr1 = high - low
+            tr2 = abs(high - prev_close)
+            tr3 = abs(low - prev_close)
+            true_range = max(tr1, tr2, tr3)
+
+            up_move = high - prev_high
+            down_move = prev_low - low
+
+            dm_plus = up_move if (up_move > 0 and up_move > down_move) else 0.0
+            dm_minus = down_move if (down_move > 0 and down_move > up_move) else 0.0
+
+            smoothed_tr = smoothed_tr - (smoothed_tr / length) + true_range
+            smoothed_dm_plus = smoothed_dm_plus - (smoothed_dm_plus / length) + dm_plus
+            smoothed_dm_minus = smoothed_dm_minus - (smoothed_dm_minus / length) + dm_minus
+
+            if smoothed_tr == 0:
+                di_plus = 0.0
+                di_minus = 0.0
+            else:
+                di_plus = (smoothed_dm_plus / smoothed_tr) * 100.0
+                di_minus = (smoothed_dm_minus / smoothed_tr) * 100.0
+
+            di_plus_arr[i] = round(di_plus, 2)
+            di_minus_arr[i] = round(di_minus, 2)
+
+            sum_di = di_plus + di_minus
+            if sum_di == 0:
+                dx = 0.0
+            else:
+                dx = (abs(di_plus - di_minus) / sum_di) * 100.0
+
+            dx_values.append(dx)
+
+            if len(dx_values) < length:
+                adx = None
+            else:
+                window = dx_values[-length:]
+                adx = sum(window) / float(length)
+                adx_arr[i] = round(adx, 2)
+
+            if adx is not None:
+                valid_adx_values.append(adx)
+                if len(valid_adx_values) >= avg_length:
+                    sma_window = valid_adx_values[-avg_length:]
+                    adx_sma = sum(sma_window) / float(avg_length)
+                    adx_sma_arr[i] = round(adx_sma, 2)
+
+        df["di_plus"] = di_plus_arr
+        df["di_minus"] = di_minus_arr
+        df["adx"] = adx_arr
+        df["adx_sma"] = adx_sma_arr
+
+        return df
+
+    def calculate_slopes(self, df: pd.DataFrame, window: int = 3) -> pd.DataFrame:
+        """Calculate slopes for EMA39, EMA50, and ADX using a rolling window."""
+        if df.empty:
+            df["ema_39_slope"] = np.nan
+            df["ema_50_slope"] = np.nan
+            df["adx_slope"] = np.nan
+            return df
+
+        df = df.copy()
+
+        if "ema_39" in df.columns:
+            df["ema_39_slope"] = ((df["ema_39"] - df["ema_39"].shift(window)) / window).round(4)
+        else:
+            df["ema_39_slope"] = np.nan
+
+        if "ema_50" in df.columns:
+            df["ema_50_slope"] = ((df["ema_50"] - df["ema_50"].shift(window)) / window).round(4)
+        else:
+            df["ema_50_slope"] = np.nan
+
+        if "adx" in df.columns:
+            df["adx_slope"] = ((df["adx"] - df["adx"].shift(window)) / window).round(4)
+        else:
+            df["adx_slope"] = np.nan
+
+        return df
+
+    def calculate_intraday_slopes(self, df: pd.DataFrame, window: int = 3) -> pd.DataFrame:
+        """Calculate slopes for EMA39 and EMA50 for intraday data."""
+        if df.empty:
+            df["ema_39_slope"] = np.nan
+            df["ema_50_slope"] = np.nan
+            return df
+
+        df = df.copy()
+
+        if "ema_39" in df.columns:
+            df["ema_39_slope"] = ((df["ema_39"] - df["ema_39"].shift(window)) / window).round(4)
+        else:
+            df["ema_39_slope"] = np.nan
+
+        if "ema_50" in df.columns:
+            df["ema_50_slope"] = ((df["ema_50"] - df["ema_50"].shift(window)) / window).round(4)
+        else:
+            df["ema_50_slope"] = np.nan
+
+        return df
+
     # -----------------------------------------------------------------------
     # Session stats & volume profile
     # -----------------------------------------------------------------------
@@ -1111,10 +1576,15 @@ class AlpacaDataCollectorOptimized:
 
     def fetch_and_process_session_data(
             self, symbol: str, dates: List[str]
-    ) -> Tuple[Dict[str, Optional[SessionStats]], pd.DataFrame]:
-        """Fetch and process multiple days of session data at once."""
+    ) -> Tuple[Dict[str, Optional[SessionStats]], pd.DataFrame, pd.DataFrame]:
+        """
+        Fetch and process multiple days of session data at once.
+
+        Returns:
+            Tuple of (session_stats_dict, daily_bars_df, first_hour_1min_df)
+        """
         if not dates:
-            return {}, pd.DataFrame()
+            return {}, pd.DataFrame(), pd.DataFrame()
 
         dates_as_date = sorted([datetime.strptime(d, "%Y-%m-%d").date() for d in dates])
         est = self.est_tz
@@ -1143,37 +1613,66 @@ class AlpacaDataCollectorOptimized:
             df = bars.df.reset_index()
 
             if df.empty:
-                return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame()
+                return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame(), pd.DataFrame()
 
             if "timestamp" not in df.columns:
                 logging.error(f"No timestamp column found for {symbol}")
-                return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame()
+                return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame(), pd.DataFrame()
 
             df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-            # Filter to regular hours only (9:30 AM - 3:59 PM ET)
-            # Convert to ET for filtering, but keep original timestamp
+            # Convert to ET for filtering
             df["_timestamp_est"] = df["timestamp"].dt.tz_convert(est)
             df["_time_decimal"] = df["_timestamp_est"].dt.hour + df["_timestamp_est"].dt.minute / 60.0
-            df = df[(df["_time_decimal"] >= 9.5) & (df["_time_decimal"] < 16.0)].copy()
+
+            # Filter to regular hours (9:30 AM - 4:00 PM ET)
+            regular_hours_df = df[(df["_time_decimal"] >= 9.5) & (df["_time_decimal"] < 16.0)].copy()
+
+            # Extract first hour data (9:30 - 10:30 AM ET)
+            first_hour_df = df[(df["_time_decimal"] >= 9.5) & (df["_time_decimal"] < 10.5)].copy()
 
             # Get date in ET for grouping
-            df["date"] = df["_timestamp_est"].dt.date
-            df = df.drop(columns=["_timestamp_est", "_time_decimal"])
+            regular_hours_df["date"] = regular_hours_df["_timestamp_est"].dt.date
+            first_hour_df["date"] = first_hour_df["_timestamp_est"].dt.date
 
-            if df.empty:
-                return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame()
+            regular_hours_df = regular_hours_df.drop(columns=["_timestamp_est", "_time_decimal"])
+            first_hour_df = first_hour_df.drop(columns=["_timestamp_est", "_time_decimal"])
+
+            if regular_hours_df.empty:
+                return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame(), pd.DataFrame()
 
             day_dfs: Dict[date, pd.DataFrame] = {}
             for d in dates_as_date:
-                day_df = df[df["date"] == d].copy()
+                day_df = regular_hours_df[regular_hours_df["date"] == d].copy()
                 if not day_df.empty:
                     day_df = self.calculate_vwap_series(day_df, include_bands=True)
                 day_dfs[d] = day_df
 
+            # Process first hour data for storage
+            first_hour_all = []
+            for d in dates_as_date:
+                fh_day = first_hour_df[first_hour_df["date"] == d].copy()
+                if not fh_day.empty:
+                    fh_day = fh_day.drop(columns=["date"], errors="ignore")
+                    fh_day["symbol"] = symbol
+                    first_hour_all.append(fh_day)
+
+            if first_hour_all:
+                first_hour_combined = pd.concat(first_hour_all, ignore_index=True)
+                # Calculate VWAP for first hour
+                first_hour_combined = self.calculate_vwap_series(first_hour_combined)
+                # Calculate EMAs
+                first_hour_combined = self.calculate_ema_series(first_hour_combined, [8, 20, 39, 50])
+                # Calculate slopes
+                first_hour_combined = self.calculate_intraday_slopes(first_hour_combined, window=3)
+                # Calculate RVOL for first hour
+                first_hour_combined = self.calculate_rvol_first_hour(first_hour_combined)
+            else:
+                first_hour_combined = pd.DataFrame()
+
         except Exception as e:
             logging.error(f"Failed to fetch session data for {symbol}: {e}")
-            return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame()
+            return {d.isoformat(): None for d in dates_as_date}, pd.DataFrame(), pd.DataFrame()
 
         results: Dict[str, Optional[SessionStats]] = {}
         profiles_to_store: List[CompositeSessionProfile] = []
@@ -1196,9 +1695,6 @@ class AlpacaDataCollectorOptimized:
             try:
                 vp = self.calculate_volume_profile_optimized(comp_df, price_levels=70)
                 vols = vp.price_levels
-                if not vols:
-                    return None
-
                 sorted_by_vol = sorted(vols, key=lambda x: x.volume, reverse=True)
                 hvn_levels = [round(v.price_level, 2) for v in sorted_by_vol[:3]]
 
@@ -1284,7 +1780,7 @@ class AlpacaDataCollectorOptimized:
 
         daily_bars_df = self.resample_to_daily_bars(day_dfs, symbol)
 
-        return results, daily_bars_df
+        return results, daily_bars_df, first_hour_combined
 
     def _store_composite_session_profiles_batch(self, profiles: List[CompositeSessionProfile]):
         """Batch insert all composite profiles in ONE transaction."""
@@ -1420,35 +1916,47 @@ class AlpacaDataCollectorOptimized:
     # Symbol processing / indicators
     # -----------------------------------------------------------------------
 
-    def process_symbol_batch(self, symbols: List[str], days_back: int = 360) -> Dict[str, List[dict]]:
-        """Process a batch of symbols in parallel."""
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days_back)
+    def process_symbol_batch(self, symbols: List[str], days_back: int = 360) -> Tuple[
+        Dict[str, List[dict]], Dict[str, pd.DataFrame]]:
+        """
+        Process a batch of symbols in parallel.
 
-        all_results: Dict[str, List[dict]] = {}
+        Returns:
+            Tuple of (daily_bars_dict, first_hour_dict)
+        """
+        all_daily_bars: Dict[str, List[dict]] = {}
+        all_first_hour: Dict[str, pd.DataFrame] = {}
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_symbol = {
-                executor.submit(self.process_single_symbol, symbol, start_date, end_date): symbol
+                executor.submit(self.process_single_symbol, symbol, datetime.now() - timedelta(days=days_back),
+                                datetime.now()): symbol
                 for symbol in symbols
             }
 
             for future in as_completed(future_to_symbol):
                 symbol = future_to_symbol[future]
                 try:
-                    result = future.result()
-                    all_results[symbol] = result
+                    daily_bars, first_hour_df = future.result()
+                    all_daily_bars[symbol] = daily_bars
+                    all_first_hour[symbol] = first_hour_df
                     logging.info(f"Processed {symbol}")
                 except Exception as e:
                     logging.error(f"Error processing {symbol}: {e}")
-                    all_results[symbol] = []
+                    all_daily_bars[symbol] = []
+                    all_first_hour[symbol] = pd.DataFrame()
 
-        return all_results
+        return all_daily_bars, all_first_hour
 
     def process_single_symbol(
             self, symbol: str, start_date: datetime, end_date: datetime
-    ) -> List[dict]:
-        """Process a single symbol - fetch daily bars and session stats."""
+    ) -> Tuple[List[dict], pd.DataFrame]:
+        """
+        Process a single symbol - fetch daily bars, session stats, and first hour data.
+
+        Returns:
+            Tuple of (daily_bars_list, first_hour_df)
+        """
         try:
             request = StockBarsRequest(
                 symbol_or_symbols=[symbol],
@@ -1456,23 +1964,23 @@ class AlpacaDataCollectorOptimized:
                 start=start_date.isoformat(),
                 end=end_date.isoformat(),
                 feed="iex",
-                adjustment=Adjustment.ALL            )
+                adjustment=Adjustment.ALL)
 
             self.api_call_count += 1
             bars = self.client.get_stock_bars(request)
             df = bars.df.reset_index()
 
             if df.empty:
-                return []
+                return [], pd.DataFrame()
 
             df["timestamp"] = pd.to_datetime(df["timestamp"])
             df = df.sort_values("timestamp").reset_index(drop=True)
 
             dates_to_fetch = [row["timestamp"].date().isoformat() for _, row in df.iterrows()]
-            session_stats, daily_df = self.fetch_and_process_session_data(symbol, dates_to_fetch)
+            session_stats, daily_df, first_hour_df = self.fetch_and_process_session_data(symbol, dates_to_fetch)
 
             if daily_df.empty:
-                return []
+                return [], first_hour_df
 
             daily_df = self.calculate_daily_indicators_optimized(daily_df)
 
@@ -1501,14 +2009,23 @@ class AlpacaDataCollectorOptimized:
                     "momentum_10": float(row.get("momentum_10")) if pd.notna(row.get("momentum_10")) else None,
                     "ema_8": float(row.get("ema_8")) if pd.notna(row.get("ema_8")) else None,
                     "ema_20": float(row.get("ema_20")) if pd.notna(row.get("ema_20")) else None,
+                    "ema_39": float(row.get("ema_39")) if pd.notna(row.get("ema_39")) else None,
+                    "ema_50": float(row.get("ema_50")) if pd.notna(row.get("ema_50")) else None,
+                    "ema_39_slope": float(row.get("ema_39_slope")) if pd.notna(row.get("ema_39_slope")) else None,
+                    "ema_50_slope": float(row.get("ema_50_slope")) if pd.notna(row.get("ema_50_slope")) else None,
+                    "adx": float(row.get("adx")) if pd.notna(row.get("adx")) else None,
+                    "adx_sma": float(row.get("adx_sma")) if pd.notna(row.get("adx_sma")) else None,
+                    "adx_slope": float(row.get("adx_slope")) if pd.notna(row.get("adx_slope")) else None,
+                    "di_plus": float(row.get("di_plus")) if pd.notna(row.get("di_plus")) else None,
+                    "di_minus": float(row.get("di_minus")) if pd.notna(row.get("di_minus")) else None,
                 }
                 result.append(bar_data)
 
-            return result
+            return result, first_hour_df
 
         except Exception as e:
             logging.error(f"Error processing {symbol}: {e}")
-            return []
+            return [], pd.DataFrame()
 
     def calculate_daily_indicators_optimized(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate all daily indicators using vectorized operations."""
@@ -1526,7 +2043,9 @@ class AlpacaDataCollectorOptimized:
 
         df = self.calculate_rsi(df, period=10)
         df = self.calculate_momentum(df, period=10)
-        df = self.calculate_ema_series(df, [8, 20])
+        df = self.calculate_ema_series(df, [8, 20, 39, 50])
+        df = self.calculate_adx_daily(df, length=14, avg_length=5)
+        df = self.calculate_slopes(df, window=3)
 
         df = df.drop(["high_low", "high_pc", "low_pc", "true_range"], axis=1, errors="ignore")
 
@@ -1571,7 +2090,7 @@ class AlpacaDataCollectorOptimized:
             timeframe=timeframe,
             start=start_date.isoformat(),
             end=end_date.isoformat(),
-            adjustment=Adjustment.ALL        )
+            adjustment=Adjustment.ALL)
 
         try:
             self.api_call_count += 1
@@ -1581,63 +2100,39 @@ class AlpacaDataCollectorOptimized:
             if df.empty:
                 return pd.DataFrame()
 
-            # Alpaca returns timestamps in UTC - keep them that way
             df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-            # Filter to market hours (use the existing method which handles timezone conversion)
             df["is_market_hours"] = df["timestamp"].apply(self.is_market_hours)
             market_hours_df = df[df["is_market_hours"]].copy()
             market_hours_df = market_hours_df.drop(columns=["is_market_hours"], errors="ignore")
 
             market_hours_df = market_hours_df.tail(MAX_BARS)
-
             market_hours_df = self.calculate_vwap_series(market_hours_df)
-            market_hours_df = self.calculate_ema_series(market_hours_df, [8, 20, 39])
+            market_hours_df = self.calculate_ema_series(market_hours_df, [8, 20, 39, 50])
+            market_hours_df = self.calculate_intraday_slopes(market_hours_df, window=3)
 
-            # Determine interval for RVOL calculation
             is_5min = timeframe.amount == 5 and timeframe.unit == TimeFrameUnit.Minute
             is_15min = timeframe.amount == 15 and timeframe.unit == TimeFrameUnit.Minute
 
-            # Calculate RVOL for both 5min and 15min candles
             if is_5min:
                 market_hours_df = self.calculate_rvol_5m(market_hours_df, lookback_sessions=RVOL_LOOKBACK_SESSIONS)
             elif is_15min:
                 market_hours_df = self.calculate_rvol_15m(market_hours_df, lookback_sessions=RVOL_LOOKBACK_SESSIONS)
 
-            # Base columns for all timeframes
             available_columns = [
-                "symbol",
-                "timestamp",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "vwap",
-                "ema_8",
-                "ema_20",
-                "ema_39",
+                "symbol", "timestamp", "open", "high", "low", "close", "volume", "vwap",
+                "ema_8", "ema_20", "ema_39", "ema_50", "ema_39_slope", "ema_50_slope",
             ]
 
-            # RVOL columns for both 5min and 15min
             if is_5min or is_15min:
                 available_columns += [
-                    "slot_index",
-                    "cum_volume",
-                    "rvol_slot_20",
-                    "rvol_slot_baseline_20",
-                    "rvol_cum_20",
-                    "rvol_cum_baseline_20",
-                    "intraday_rvol_20",
-                    "avg_daily_volume_20",
-                    "pct_of_day_typical",
+                    "slot_index", "cum_volume", "rvol_slot_20", "rvol_slot_baseline_20",
+                    "rvol_cum_20", "rvol_cum_baseline_20", "intraday_rvol_20",
+                    "avg_daily_volume_20", "pct_of_day_typical",
                 ]
 
             market_hours_df = market_hours_df[[c for c in available_columns if c in market_hours_df.columns]]
 
-            # Convert timestamp to UTC string format for storage (remove timezone info for DB)
             if "timestamp" in market_hours_df.columns:
-                # Ensure UTC, then remove tz for storage
                 if market_hours_df["timestamp"].dt.tz is not None:
                     market_hours_df["timestamp"] = market_hours_df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(
                         None)
@@ -1670,12 +2165,10 @@ class AlpacaDataCollectorOptimized:
                     df = df.copy()
                     if 'timestamp' in df.columns:
                         df['timestamp'] = pd.to_datetime(df['timestamp'])
-                        # Store as UTC timestamp string (no timezone suffix)
                         df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
                     records = df.to_dict('records')
                     all_records.extend(records)
 
-            # Delete existing records for these symbols (full rebuild)
             if symbols_to_delete:
                 placeholders = ",".join(["%s"] * len(symbols_to_delete))
                 cur.execute(
@@ -1715,6 +2208,79 @@ class AlpacaDataCollectorOptimized:
             cur.close()
             conn.close()
 
+    def batch_store_first_hour_data(self, data_dict: Dict[str, pd.DataFrame]):
+        """Store first hour 1-minute candles in Postgres."""
+        if not data_dict:
+            return
+
+        conn = self._get_pg_conn()
+        cur = conn.cursor()
+
+        try:
+            all_records: List[dict] = []
+            symbols_to_delete = set()
+
+            for symbol, df in data_dict.items():
+                if not df.empty:
+                    symbols_to_delete.add(symbol)
+                    df = df.copy()
+                    if 'timestamp' in df.columns:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        # Ensure UTC and remove timezone for storage
+                        if df['timestamp'].dt.tz is not None:
+                            df['timestamp'] = df['timestamp'].dt.tz_convert('UTC').dt.tz_localize(None)
+                        df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                    records = df.to_dict('records')
+                    all_records.extend(records)
+
+            if symbols_to_delete:
+                placeholders = ",".join(["%s"] * len(symbols_to_delete))
+                cur.execute(
+                    f"DELETE FROM candles_1min_first_hour WHERE symbol IN ({placeholders})",
+                    list(symbols_to_delete),
+                )
+
+            if all_records:
+                # Define columns for first hour table
+                columns = [
+                    "symbol", "timestamp", "open", "high", "low", "close", "volume", "vwap",
+                    "ema_8", "ema_20", "ema_39", "ema_50", "ema_39_slope", "ema_50_slope",
+                    "slot_index", "cum_volume", "rvol_slot_20", "rvol_slot_baseline_20",
+                    "rvol_cum_20", "rvol_cum_baseline_20", "ib_high", "ib_low", "ib_range"
+                ]
+
+                # Filter to only columns that exist in records
+                available_cols = [c for c in columns if c in all_records[0]]
+                col_list = ",".join(available_cols)
+                placeholders = ",".join(["%s"] * len(available_cols))
+
+                insert_sql = f"""
+                    INSERT INTO candles_1min_first_hour ({col_list})
+                    VALUES ({placeholders})
+                    ON CONFLICT (symbol, timestamp) DO UPDATE SET
+                    {", ".join([f"{col}=EXCLUDED.{col}" for col in available_cols if col not in ("symbol", "timestamp")])}
+                """
+
+                batched = [[record.get(col) for col in available_cols] for record in all_records]
+
+                for i in range(0, len(batched), DB_BATCH_SIZE):
+                    execute_batch(
+                        cur,
+                        insert_sql,
+                        batched[i: i + DB_BATCH_SIZE],
+                        page_size=DB_BATCH_SIZE,
+                    )
+
+            conn.commit()
+            logging.info(f"Batch stored {len(all_records)} first hour 1-min records")
+
+        except Exception as e:
+            logging.error(f"Error storing first hour data: {e}")
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
+
     def batch_store_daily_bars(self, all_bars: Dict[str, List[dict]]):
         """Store all daily bars in Postgres using batch operations."""
         if not all_bars:
@@ -1739,6 +2305,8 @@ class AlpacaDataCollectorOptimized:
                 "symbol", "timestamp", "open", "high", "low", "close", "volume",
                 "vwap", "vwap_upper", "vwap_lower", "session_high", "session_low",
                 "poc", "atr", "rsi_10", "momentum_10", "ema_8", "ema_20", "ema_39_of_15min",
+                "ema_39", "ema_50", "ema_39_slope", "ema_50_slope",
+                "adx", "adx_sma", "adx_slope", "di_plus", "di_minus",
             ]
             col_list = ",".join(columns)
             placeholders = ",".join(["%s"] * len(columns))
@@ -1758,6 +2326,9 @@ class AlpacaDataCollectorOptimized:
                     bar.get("session_low"), bar.get("poc"), bar.get("atr"),
                     bar.get("rsi_10"), bar.get("momentum_10"), bar.get("ema_8"),
                     bar.get("ema_20"), bar.get("ema_39_of_15min"),
+                    bar.get("ema_39"), bar.get("ema_50"), bar.get("ema_39_slope"), bar.get("ema_50_slope"),
+                    bar.get("adx"), bar.get("adx_sma"), bar.get("adx_slope"),
+                    bar.get("di_plus"), bar.get("di_minus"),
                 ]
                 for bar in all_records
             ]
@@ -1791,8 +2362,7 @@ class AlpacaDataCollectorOptimized:
                     trade_date,
                     ema_39
                 FROM (
-                    SELECT
-                    symbol, timestamp :: date AS trade_date, ema_39, timestamp
+                    SELECT symbol, timestamp :: date AS trade_date, ema_39, timestamp
                     FROM candles_15min
                     WHERE symbol = ANY (%s)
                     AND ema_39 IS NOT NULL
@@ -1841,16 +2411,18 @@ class AlpacaDataCollectorOptimized:
                 f"Processing batch {i // BATCH_SIZE + 1}/{(len(tickers) - 1) // BATCH_SIZE + 1}: {batch}"
             )
 
-            daily_bars_batch = self.process_symbol_batch(batch, days_back)
+            # Process daily bars and first hour data together
+            daily_bars_batch, first_hour_batch = self.process_symbol_batch(batch, days_back)
             self.batch_store_daily_bars(daily_bars_batch)
+            self.batch_store_first_hour_data(first_hour_batch)
 
-            # Fetch & store 5min candles (now includes RVOL fields)
+            # Fetch & store 5min candles
             data_5min = self.get_market_hours_data_batch(
                 batch, TimeFrame(5, TimeFrameUnit.Minute), days_back=days_back
             )
             self.batch_store_data(data_5min, "candles_5min")
 
-            # Fetch & store 15min candles (includes RVOL fields)
+            # Fetch & store 15min candles
             data_15min = self.get_market_hours_data_batch(
                 batch, TimeFrame(15, TimeFrameUnit.Minute), days_back=days_back
             )
@@ -1874,7 +2446,8 @@ class AlpacaDataCollectorOptimized:
         cur = conn.cursor()
 
         try:
-            tables = ["candles_5min", "candles_15min", "daily_bars", "composite_session_profiles"]
+            tables = ["candles_5min", "candles_15min", "candles_1min_first_hour", "daily_bars",
+                      "composite_session_profiles"]
 
             for table in tables:
                 if table == "composite_session_profiles":
@@ -1902,6 +2475,27 @@ class AlpacaDataCollectorOptimized:
                 print(f"  Total Records: {total_records}")
                 print(f"  Date Range: {earliest} to {latest}")
 
+            # First hour 1-min quality check
+            cur.execute("""
+                        SELECT COUNT(*)                             as total_rows,
+                               COUNT(rvol_slot_20)                  as slot_rvol_populated,
+                               COUNT(rvol_cum_20)                   as cum_rvol_populated,
+                               COUNT(ib_high)                       as ib_populated,
+                               ROUND(AVG(rvol_slot_20)::numeric, 2) as avg_slot_rvol,
+                               ROUND(AVG(ib_range)::numeric, 2)     as avg_ib_range
+                        FROM candles_1min_first_hour
+                        WHERE timestamp > CURRENT_DATE - INTERVAL '30 days'
+                        """)
+            row = cur.fetchone()
+            if row:
+                print(f"\nFirst Hour 1-Min Quality (last 30 days):")
+                print(f"  Total rows: {row[0]}")
+                print(f"  Slot RVOL populated: {row[1]} ({100 * row[1] / max(row[0], 1):.1f}%)")
+                print(f"  Cum RVOL populated: {row[2]} ({100 * row[2] / max(row[0], 1):.1f}%)")
+                print(f"  IB metrics populated: {row[3]} ({100 * row[3] / max(row[0], 1):.1f}%)")
+                print(f"  Avg Slot RVOL: {row[4]}")
+                print(f"  Avg IB Range: {row[5]}")
+
             # RVOL quality check for 5min
             cur.execute("""
                         SELECT COUNT(*)                                                                     as total_rows,
@@ -1925,28 +2519,24 @@ class AlpacaDataCollectorOptimized:
                 print(f"  Median Slot RVOL: {row[5]}")
                 print(f"  Avg Intraday RVOL: {row[6]}")
 
-            # RVOL quality check for 15min
+            # TrendEngine indicators quality check
             cur.execute("""
-                        SELECT COUNT(*)                                                                     as total_rows,
-                               COUNT(rvol_slot_20)                                                          as slot_rvol_populated,
-                               COUNT(rvol_cum_20)                                                           as cum_rvol_populated,
-                               COUNT(intraday_rvol_20)                                                      as intraday_rvol_populated,
-                               ROUND(AVG(rvol_slot_20)::numeric, 2)                                         as avg_slot_rvol,
-                               ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rvol_slot_20)::numeric, 2) as median_slot_rvol,
-                               ROUND(AVG(intraday_rvol_20)::numeric, 2)                                     as avg_intraday_rvol
-                        FROM candles_15min
+                        SELECT COUNT(*)                    as total_rows,
+                               COUNT(ema_39)               as ema39_populated,
+                               COUNT(ema_50)               as ema50_populated,
+                               COUNT(adx)                  as adx_populated,
+                               ROUND(AVG(adx)::numeric, 2) as avg_adx
+                        FROM daily_bars
                         WHERE timestamp > CURRENT_DATE - INTERVAL '30 days'
                         """)
             row = cur.fetchone()
             if row:
-                print(f"\nRVOL Quality - candles_15min (last 30 days):")
+                print(f"\nTrendEngine Indicators - daily_bars (last 30 days):")
                 print(f"  Total rows: {row[0]}")
-                print(f"  Slot RVOL populated: {row[1]} ({100 * row[1] / max(row[0], 1):.1f}%)")
-                print(f"  Cum RVOL populated: {row[2]} ({100 * row[2] / max(row[0], 1):.1f}%)")
-                print(f"  Intraday RVOL populated: {row[3]} ({100 * row[3] / max(row[0], 1):.1f}%)")
-                print(f"  Avg Slot RVOL: {row[4]}")
-                print(f"  Median Slot RVOL: {row[5]}")
-                print(f"  Avg Intraday RVOL: {row[6]}")
+                print(f"  EMA39 populated: {row[1]} ({100 * row[1] / max(row[0], 1):.1f}%)")
+                print(f"  EMA50 populated: {row[2]} ({100 * row[2] / max(row[0], 1):.1f}%)")
+                print(f"  ADX populated: {row[3]} ({100 * row[3] / max(row[0], 1):.1f}%)")
+                print(f"  Avg ADX: {row[4]}")
 
         finally:
             cur.close()
