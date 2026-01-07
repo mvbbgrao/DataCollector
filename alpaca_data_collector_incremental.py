@@ -68,7 +68,7 @@ TICKERS_FILE = "ticker_list.txt"
 MARKET_START_PST, MARKET_END_PST = 6.5, 12.99
 MAX_WORKERS, BATCH_SIZE, DB_BATCH_SIZE = 20, 10, 100
 RVOL_LOOKBACK_SESSIONS, RVOL_MIN_SESSIONS, RVOL_MIN_BASELINE_VOLUME = 20, 5, 100
-DEFAULT_INCREMENTAL_DAYS = 5
+DEFAULT_INCREMENTAL_DAYS = 7
 EMA_HISTORY_BARS = 100
 
 # Slot counts for different timeframes
@@ -78,7 +78,7 @@ SLOTS_1MIN_FIRST_HOUR = 60  # 60 minutes in first hour
 
 # First hour window (ET)
 FIRST_HOUR_START_MINUTES = 9 * 60 + 30  # 9:30 AM ET = 570 minutes
-FIRST_HOUR_END_MINUTES = 10 * 60 + 30   # 10:30 AM ET = 630 minutes
+FIRST_HOUR_END_MINUTES = 10 * 60 + 30  # 10:30 AM ET = 630 minutes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
                     handlers=[logging.FileHandler("incremental_updater.log"), logging.StreamHandler()])
@@ -300,14 +300,12 @@ class AlpacaIncrementalUpdater:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         try:
             cur.execute("""
-                SELECT symbol, timestamp, open, high, low, close, volume, vwap, 
-                       atr, rsi_10, momentum_10, ema_8, ema_20, ema_39, ema_50, 
-                       adx, adx_sma, di_plus, di_minus
-                FROM daily_bars
-                WHERE symbol = %s
-                ORDER BY timestamp DESC
-                LIMIT %s
-            """, (symbol, limit))
+                        SELECT symbol, timestamp, open, high, low, close, volume, vwap, atr, rsi_10, momentum_10, ema_8, ema_20, ema_39, ema_50, adx, adx_sma, di_plus, di_minus
+                        FROM daily_bars
+                        WHERE symbol = %s
+                        ORDER BY timestamp DESC
+                            LIMIT %s
+                        """, (symbol, limit))
             rows = cur.fetchall()
             if not rows:
                 return pd.DataFrame()
@@ -408,12 +406,13 @@ class AlpacaIncrementalUpdater:
         try:
             # Get unique session dates (last N sessions)
             cur.execute("""
-                SELECT DISTINCT (timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')::date as session_date
-                FROM candles_1min_first_hour
-                WHERE symbol = %s AND slot_index IS NOT NULL
-                ORDER BY session_date DESC
-                LIMIT %s
-            """, (symbol, RVOL_LOOKBACK_SESSIONS + 1))
+                        SELECT DISTINCT (timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York') ::date as session_date
+                        FROM candles_1min_first_hour
+                        WHERE symbol = %s
+                          AND slot_index IS NOT NULL
+                        ORDER BY session_date DESC
+                            LIMIT %s
+                        """, (symbol, RVOL_LOOKBACK_SESSIONS + 1))
 
             session_dates = [row['session_date'] for row in cur.fetchall()]
             if len(session_dates) <= 1:
@@ -424,14 +423,16 @@ class AlpacaIncrementalUpdater:
 
             # Fetch slot data for baseline dates
             cur.execute("""
-                SELECT slot_index, volume, cum_volume,
-                       (timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')::date as session_date
-                FROM candles_1min_first_hour
-                WHERE symbol = %s
-                  AND (timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')::date = ANY(%s)
-                  AND slot_index IS NOT NULL
-                ORDER BY session_date, slot_index
-            """, (symbol, baseline_dates))
+                        SELECT slot_index,
+                               volume,
+                               cum_volume,
+                               (timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York') ::date as session_date
+                        FROM candles_1min_first_hour
+                        WHERE symbol = %s
+                          AND (timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')::date = ANY(%s)
+                          AND slot_index IS NOT NULL
+                        ORDER BY session_date, slot_index
+                        """, (symbol, baseline_dates))
 
             slot_data = {i: [] for i in range(SLOTS_1MIN_FIRST_HOUR)}
             for row in cur.fetchall():
@@ -546,7 +547,7 @@ class AlpacaIncrementalUpdater:
             df["high"] - df["low"],
             np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1)))
         )
-        df["atr"] = df["tr"].ewm(span=period, adjust=False).mean().round(4)
+        df["atr"] = df["tr"].ewm(alpha=1 / period, adjust=False).mean().round(4)  # RMA (TradingView)
         return df.drop(columns=["tr"], errors="ignore")
 
     def _calc_adx(self, df: pd.DataFrame, length: int = 14, avg_length: int = 5) -> pd.DataFrame:
@@ -679,6 +680,58 @@ class AlpacaIncrementalUpdater:
             df["ema_50_slope"] = np.nan
 
         return df
+
+    def _calc_intraday_atr(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """
+        Calculate ATR for intraday candles with configurable period.
+
+        Args:
+            df: DataFrame with OHLC data
+            period: ATR period (8 for 15-min, 12 for 5-min)
+
+        Returns:
+            DataFrame with 'atr' column added
+        """
+        if df.empty or len(df) < 2:
+            df["atr"] = np.nan
+            return df
+
+        df = df.copy()
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        df["tr"] = np.maximum(
+            df["high"] - df["low"],
+            np.maximum(abs(df["high"] - df["close"].shift(1)), abs(df["low"] - df["close"].shift(1)))
+        )
+        df["atr"] = df["tr"].ewm(alpha=1 / period, adjust=False).mean().round(4)  # RMA (TradingView)
+
+        return df.drop(columns=["tr"], errors="ignore")
+
+    def calculate_intraday_atr_with_history(self, new_df: pd.DataFrame, historical_df: pd.DataFrame,
+                                            period: int = 14) -> pd.DataFrame:
+        """Calculate intraday ATR using historical data for continuity."""
+        if new_df.empty:
+            new_df["atr"] = np.nan
+            return new_df
+
+        new_df = new_df.copy()
+        if historical_df.empty or len(historical_df) < period:
+            return self._calc_intraday_atr(new_df, period)
+
+        historical_df = historical_df.copy()
+        new_df["_is_new"] = True
+        historical_df["_is_new"] = False
+        new_df["timestamp"] = pd.to_datetime(new_df["timestamp"])
+        historical_df["timestamp"] = pd.to_datetime(historical_df["timestamp"])
+
+        combined = pd.concat([historical_df, new_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["symbol", "timestamp"], keep="last")
+        combined = combined.sort_values("timestamp").reset_index(drop=True)
+
+        combined = self._calc_intraday_atr(combined, period)
+
+        result = combined[combined["_is_new"] == True].drop(columns=["_is_new"], errors="ignore")
+        return result.sort_values("timestamp").reset_index(drop=True)
 
     def calculate_daily_indicators_with_history(self, new_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
         """Calculate all daily indicators including ADX and slopes with historical continuity."""
@@ -1229,7 +1282,15 @@ class AlpacaIncrementalUpdater:
                 "vwap", "vwap_upper", "vwap_lower", "session_high", "session_low",
                 "poc", "atr", "rsi_10", "momentum_10", "ema_8", "ema_20", "ema_39_of_15min",
                 "ema_39", "ema_50", "ema_39_slope", "ema_50_slope",
-                "adx", "adx_sma", "adx_slope", "di_plus", "di_minus"
+                "adx", "adx_sma", "adx_slope", "di_plus", "di_minus",
+                # IB metrics
+                "ib_high", "ib_low", "ib_range", "ib_volume",
+                # Outcome tracking
+                "ib_break_up", "ib_break_down", "close_vs_ib",
+                # Precomputed ratios
+                "atr_15min_ratio_10d", "ib_range_ratio_10d",
+                # Volume metrics
+                "avg_daily_volume_20"
             ]
             update_clause = ", ".join([f"{c}=EXCLUDED.{c}" for c in columns if c not in ("symbol", "timestamp")])
 
@@ -1276,8 +1337,8 @@ class AlpacaIncrementalUpdater:
                 """INSERT INTO composite_session_profiles
                    (symbol, session_date, lookback_days, composite_poc, composite_vah, composite_val,
                     total_volume, hvn_levels, lvn_levels, imbalance_score)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (symbol, session_date, lookback_days) DO UPDATE SET
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (symbol, session_date, lookback_days) DO
+                UPDATE SET
                     composite_poc=EXCLUDED.composite_poc, composite_vah=EXCLUDED.composite_vah,
                     composite_val=EXCLUDED.composite_val, total_volume=EXCLUDED.total_volume,
                     hvn_levels=EXCLUDED.hvn_levels, lvn_levels=EXCLUDED.lvn_levels,
@@ -1303,26 +1364,217 @@ class AlpacaIncrementalUpdater:
         try:
             cur = conn.cursor()
             cur.execute("""
-                WITH last_ema AS (
-                    SELECT DISTINCT ON (symbol, trade_date)
-                        symbol, trade_date, ema_39
-                    FROM (
-                        SELECT symbol, timestamp::date AS trade_date, ema_39, timestamp
-                        FROM candles_15min
-                        WHERE symbol = ANY (%s) AND ema_39 IS NOT NULL
-                    ) t
-                    ORDER BY symbol, trade_date, timestamp DESC
-                )
-                UPDATE daily_bars d
-                SET ema_39_of_15min = l.ema_39
-                FROM last_ema l
-                WHERE d.symbol = l.symbol AND d.timestamp = l.trade_date
-            """, (symbols,))
+                        WITH last_ema AS (SELECT DISTINCT
+                        ON (symbol, trade_date)
+                            symbol, trade_date, ema_39
+                        FROM (
+                            SELECT symbol, timestamp :: date AS trade_date, ema_39, timestamp
+                            FROM candles_15min
+                            WHERE symbol = ANY (%s) AND ema_39 IS NOT NULL
+                            ) t
+                        ORDER BY symbol, trade_date, timestamp DESC
+                            )
+                        UPDATE daily_bars d
+                        SET ema_39_of_15min = l.ema_39 FROM last_ema l
+                        WHERE d.symbol = l.symbol AND d.timestamp = l.trade_date
+                        """, (symbols,))
             conn.commit()
             logging.info(f"Updated ema_39_of_15min for {len(symbols)} symbols")
         except Exception as e:
             conn.rollback()
             logging.error(f"Error updating ema_39_of_15min: {e}")
+        finally:
+            if cur:
+                cur.close()
+            conn.close()
+
+    def update_daily_bars_with_ib_metrics(self, symbols: List[str]):
+        """
+        Update daily_bars with IB metrics from the first 15-min candle of each day.
+
+        IB (Initial Balance) = first 15-min candle:
+        - ib_high, ib_low, ib_range, ib_volume
+        - ib_break_up: True if day's high > ib_high
+        - ib_break_down: True if day's low < ib_low
+        - close_vs_ib: 'above' / 'within' / 'below'
+        """
+        if not symbols:
+            return
+
+        conn = self._get_pg_conn()
+        cur = None
+        try:
+            cur = conn.cursor()
+            # Get first 15-min candle (slot_index = 0) for each day
+            cur.execute(
+                """
+                WITH first_candle AS (SELECT DISTINCT
+                ON (symbol, timestamp :: date)
+                    symbol,
+                    timestamp :: date as trade_date,
+                    high as ib_high,
+                    low as ib_low,
+                    high - low as ib_range,
+                    volume as ib_volume
+                FROM candles_15min
+                WHERE symbol = ANY (%s)
+                  AND slot_index = 0
+                ORDER BY symbol, timestamp :: date, timestamp
+                    ),
+                    day_stats AS (
+                SELECT
+                    symbol, timestamp :: date as trade_date, MAX (high) as day_high, MIN (low) as day_low, (array_agg(close ORDER BY timestamp DESC))[1] as day_close
+                FROM candles_15min
+                WHERE symbol = ANY (%s)
+                GROUP BY symbol, timestamp :: date
+                    )
+                UPDATE daily_bars d
+                SET ib_high       = fc.ib_high,
+                    ib_low        = fc.ib_low,
+                    ib_range      = fc.ib_range,
+                    ib_volume     = fc.ib_volume,
+                    ib_break_up   = (ds.day_high > fc.ib_high),
+                    ib_break_down = (ds.day_low < fc.ib_low),
+                    close_vs_ib   = CASE
+                                        WHEN ds.day_close > fc.ib_high THEN 'above'
+                                        WHEN ds.day_close < fc.ib_low THEN 'below'
+                                        ELSE 'within'
+                        END FROM first_candle fc
+                JOIN day_stats ds
+                ON fc.symbol = ds.symbol AND fc.trade_date = ds.trade_date
+                WHERE d.symbol = fc.symbol
+                  AND d.timestamp = fc.trade_date;
+                """,
+                (symbols, symbols),
+            )
+            conn.commit()
+            logging.info(f"Updated IB metrics in daily_bars for {len(symbols)} symbols")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error updating IB metrics: {e}")
+        finally:
+            if cur:
+                cur.close()
+            conn.close()
+
+    def update_daily_bars_with_ratios(self, symbols: List[str], lookback_days: int = 10):
+        """
+        Update daily_bars with precomputed ratios:
+        - atr_15min_ratio_10d: today's last ATR from 15min / SMA(last 10 days' ATR)
+        - ib_range_ratio_10d: today's ib_range / SMA(last 10 days' ib_range)
+        """
+        if not symbols:
+            return
+
+        conn = self._get_pg_conn()
+        cur = None
+        try:
+            cur = conn.cursor()
+            # ATR ratio from 15-min candles (using last ATR of each day)
+            cur.execute(
+                """
+                WITH daily_atr AS (SELECT DISTINCT
+                ON (symbol, timestamp :: date)
+                    symbol,
+                    timestamp :: date as trade_date,
+                    atr as atr_15min
+                FROM candles_15min
+                WHERE symbol = ANY (%s)
+                  AND atr IS NOT NULL
+                ORDER BY symbol, timestamp :: date, timestamp DESC
+                    ),
+                    atr_with_sma AS (
+                SELECT
+                    symbol, trade_date, atr_15min, AVG (atr_15min) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN %s PRECEDING AND 1 PRECEDING
+                    ) as atr_sma_10d
+                FROM daily_atr
+                    )
+                UPDATE daily_bars d
+                SET atr_15min_ratio_10d = ROUND((a.atr_15min / NULLIF(a.atr_sma_10d, 0)):: numeric, 4) FROM atr_with_sma a
+                WHERE d.symbol = a.symbol
+                  AND d.timestamp = a.trade_date
+                  AND a.atr_sma_10d IS NOT NULL;
+                """,
+                (symbols, lookback_days),
+            )
+
+            # IB range ratio
+            cur.execute(
+                """
+                WITH ib_with_sma AS (SELECT symbol,
+                    timestamp as trade_date
+                   , ib_range
+                   , AVG (ib_range) OVER (
+                    PARTITION BY symbol
+                    ORDER BY timestamp
+                    ROWS BETWEEN %s PRECEDING AND 1 PRECEDING
+                    ) as ib_range_sma_10d
+                FROM daily_bars
+                WHERE symbol = ANY (%s)
+                  AND ib_range IS NOT NULL
+                    )
+                UPDATE daily_bars d
+                SET ib_range_ratio_10d = ROUND((i.ib_range / NULLIF(i.ib_range_sma_10d, 0)):: numeric, 4) FROM ib_with_sma i
+                WHERE d.symbol = i.symbol
+                  AND d.timestamp = i.trade_date
+                  AND i.ib_range_sma_10d IS NOT NULL;
+                """,
+                (lookback_days, symbols),
+            )
+
+            conn.commit()
+            logging.info(f"Updated ATR and IB ratios in daily_bars for {len(symbols)} symbols")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error updating ratios: {e}")
+        finally:
+            if cur:
+                cur.close()
+            conn.close()
+
+    def update_daily_bars_with_avg_volume(self, symbols: List[str]):
+        """
+        Update daily_bars with avg_daily_volume_20 from candles_15min.
+
+        This provides normalized access to the 20-day average daily volume
+        for real-time RVOL calculations.
+        """
+        if not symbols:
+            return
+
+        conn = self._get_pg_conn()
+        cur = None
+        try:
+            cur = conn.cursor()
+            # Get the most recent avg_daily_volume_20 for each symbol/date from 15min candles
+            cur.execute(
+                """
+                WITH latest_avg_vol AS (SELECT DISTINCT
+                ON (symbol, timestamp :: date)
+                    symbol,
+                    timestamp :: date as trade_date,
+                    avg_daily_volume_20
+                FROM candles_15min
+                WHERE symbol = ANY (%s)
+                  AND avg_daily_volume_20 IS NOT NULL
+                ORDER BY symbol, timestamp :: date, timestamp DESC
+                    )
+                UPDATE daily_bars d
+                SET avg_daily_volume_20 = v.avg_daily_volume_20 FROM latest_avg_vol v
+                WHERE d.symbol = v.symbol
+                  AND d.timestamp = v.trade_date;
+                """,
+                (symbols,),
+            )
+
+            conn.commit()
+            logging.info(f"Updated avg_daily_volume_20 in daily_bars for {len(symbols)} symbols")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error updating avg_daily_volume_20: {e}")
         finally:
             if cur:
                 cur.close()
@@ -1368,7 +1620,8 @@ class AlpacaIncrementalUpdater:
                         "symbol": row["symbol"],
                         "timestamp": row["timestamp"].date().isoformat(),
                         "open": float(row["open"]) if pd.notna(row["open"]) else None,
-                        "high": float(stats.highest_high) if stats else float(row["high"]) if pd.notna(row["high"]) else None,
+                        "high": float(stats.highest_high) if stats else float(row["high"]) if pd.notna(
+                            row["high"]) else None,
                         "low": float(row["low"]) if pd.notna(row["low"]) else None,
                         "close": float(row["close"]) if pd.notna(row["close"]) else None,
                         "volume": int(stats.session_volume) if stats else 0,
@@ -1401,6 +1654,8 @@ class AlpacaIncrementalUpdater:
                 historical_5min = self.get_historical_candles_from_db(symbol, "candles_5min", EMA_HISTORY_BARS)
                 data_5min = self.calculate_ema_with_history(data_5min, historical_5min, [8, 20, 39, 50])
                 data_5min = self._calc_intraday_slopes(data_5min, window=3)
+                data_5min = self.calculate_intraday_atr_with_history(data_5min, historical_5min,
+                                                                     period=12)  # ATR(12) for 5-min
                 data_5min = self.calculate_rvol_incremental_5m(data_5min, symbol)
 
                 if data_5min["timestamp"].dt.tz is not None:
@@ -1410,7 +1665,9 @@ class AlpacaIncrementalUpdater:
                     "symbol", "timestamp", "open", "high", "low", "close", "volume", "vwap",
                     "ema_8", "ema_20", "ema_39", "ema_50", "ema_39_slope", "ema_50_slope",
                     "slot_index", "cum_volume", "rvol_slot_20", "rvol_slot_baseline_20",
-                    "rvol_cum_20", "rvol_cum_baseline_20", "intraday_rvol_20", "avg_daily_volume_20", "pct_of_day_typical"
+                    "rvol_cum_20", "rvol_cum_baseline_20", "intraday_rvol_20", "avg_daily_volume_20",
+                    "pct_of_day_typical",
+                    "atr"
                 ]
                 result["candles_5min"] = data_5min[[c for c in cols if c in data_5min.columns]]
 
@@ -1421,6 +1678,8 @@ class AlpacaIncrementalUpdater:
                 historical_15min = self.get_historical_candles_from_db(symbol, "candles_15min", EMA_HISTORY_BARS)
                 data_15min = self.calculate_ema_with_history(data_15min, historical_15min, [8, 20, 39, 50])
                 data_15min = self._calc_intraday_slopes(data_15min, window=3)
+                data_15min = self.calculate_intraday_atr_with_history(data_15min, historical_15min,
+                                                                      period=8)  # ATR(8) for 15-min
                 data_15min = self.calculate_rvol_incremental_15m(data_15min, symbol)
 
                 if data_15min["timestamp"].dt.tz is not None:
@@ -1430,7 +1689,9 @@ class AlpacaIncrementalUpdater:
                     "symbol", "timestamp", "open", "high", "low", "close", "volume", "vwap",
                     "ema_8", "ema_20", "ema_39", "ema_50", "ema_39_slope", "ema_50_slope",
                     "slot_index", "cum_volume", "rvol_slot_20", "rvol_slot_baseline_20",
-                    "rvol_cum_20", "rvol_cum_baseline_20", "intraday_rvol_20", "avg_daily_volume_20", "pct_of_day_typical"
+                    "rvol_cum_20", "rvol_cum_baseline_20", "intraday_rvol_20", "avg_daily_volume_20",
+                    "pct_of_day_typical",
+                    "atr"
                 ]
                 result["candles_15min"] = data_15min[[c for c in cols if c in data_15min.columns]]
 
@@ -1438,7 +1699,8 @@ class AlpacaIncrementalUpdater:
             data_1min_fh = self.fetch_recent_first_hour_data(symbol, days_back)
             if not data_1min_fh.empty:
                 data_1min_fh = self.calculate_vwap_series(data_1min_fh)
-                historical_1min_fh = self.get_historical_candles_from_db(symbol, "candles_1min_first_hour", EMA_HISTORY_BARS)
+                historical_1min_fh = self.get_historical_candles_from_db(symbol, "candles_1min_first_hour",
+                                                                         EMA_HISTORY_BARS)
                 data_1min_fh = self.calculate_ema_with_history(data_1min_fh, historical_1min_fh, [8, 20, 39, 50])
                 data_1min_fh = self._calc_intraday_slopes(data_1min_fh, window=3)
                 data_1min_fh = self.calculate_rvol_incremental_first_hour(data_1min_fh, symbol)
@@ -1459,7 +1721,8 @@ class AlpacaIncrementalUpdater:
 
         return result
 
-    def process_batch_incremental(self, symbols: List[str], days_back: int = DEFAULT_INCREMENTAL_DAYS) -> Dict[str, Dict]:
+    def process_batch_incremental(self, symbols: List[str], days_back: int = DEFAULT_INCREMENTAL_DAYS) -> Dict[
+        str, Dict]:
         """Process a batch of symbols in parallel."""
         results = {}
 
@@ -1518,11 +1781,21 @@ class AlpacaIncrementalUpdater:
             self.upsert_first_hour_candles(c1_fh_dict)
             self.update_daily_bars_with_ema39_of_15min(batch)
 
+            # Update IB metrics from first 15-min candle
+            self.update_daily_bars_with_ib_metrics(batch)
+
+            # Update ATR and IB ratios
+            self.update_daily_bars_with_ratios(batch, lookback_days=10)
+
+            # Update avg_daily_volume_20 from intraday tables
+            self.update_daily_bars_with_avg_volume(batch)
+
             logging.info(f"Batch completed in {time.time() - batch_start:.2f} seconds")
 
         total_time = time.time() - self.start_time
         logging.info(f"Incremental update completed in {total_time:.2f} seconds")
-        logging.info(f"Total API calls: {self.api_call_count}, Avg per ticker: {self.api_call_count / len(tickers):.2f}")
+        logging.info(
+            f"Total API calls: {self.api_call_count}, Avg per ticker: {self.api_call_count / len(tickers):.2f}")
 
     def get_update_summary(self):
         """Print summary of today's data including first hour candles."""
@@ -1531,18 +1804,22 @@ class AlpacaIncrementalUpdater:
         try:
             cur = conn.cursor()
             cur.execute("""
-                SELECT 'candles_15min', COUNT(*), COUNT(DISTINCT symbol)
-                FROM candles_15min WHERE timestamp::date = CURRENT_DATE
-                UNION ALL
-                SELECT 'candles_5min', COUNT(*), COUNT(DISTINCT symbol)
-                FROM candles_5min WHERE timestamp::date = CURRENT_DATE
-                UNION ALL
-                SELECT 'candles_1min_first_hour', COUNT(*), COUNT(DISTINCT symbol)
-                FROM candles_1min_first_hour WHERE timestamp::date = CURRENT_DATE
-                UNION ALL
-                SELECT 'daily_bars', COUNT(*), COUNT(DISTINCT symbol)
-                FROM daily_bars WHERE timestamp = CURRENT_DATE
-            """)
+                        SELECT 'candles_15min', COUNT(*), COUNT(DISTINCT symbol)
+                        FROM candles_15min
+                        WHERE timestamp ::date = CURRENT_DATE
+                        UNION ALL
+                        SELECT 'candles_5min', COUNT(*), COUNT(DISTINCT symbol)
+                        FROM candles_5min
+                        WHERE timestamp ::date = CURRENT_DATE
+                        UNION ALL
+                        SELECT 'candles_1min_first_hour', COUNT(*), COUNT(DISTINCT symbol)
+                        FROM candles_1min_first_hour
+                        WHERE timestamp ::date = CURRENT_DATE
+                        UNION ALL
+                        SELECT 'daily_bars', COUNT(*), COUNT(DISTINCT symbol)
+                        FROM daily_bars
+                        WHERE timestamp = CURRENT_DATE
+                        """)
 
             print("\n=== Today's Data Summary ===")
             for row in cur.fetchall():
@@ -1550,106 +1827,106 @@ class AlpacaIncrementalUpdater:
 
             # First hour 1-min quality check
             cur.execute("""
-                SELECT COUNT(*),
-                       COUNT(rvol_slot_20),
-                       COUNT(rvol_cum_20),
-                       COUNT(ib_high),
-                       ROUND(AVG(rvol_slot_20)::numeric, 2),
-                       ROUND(AVG(ib_range)::numeric, 2)
-                FROM candles_1min_first_hour
-                WHERE timestamp::date = CURRENT_DATE
-            """)
+                        SELECT COUNT(*),
+                               COUNT(rvol_slot_20),
+                               COUNT(rvol_cum_20),
+                               COUNT(ib_high),
+                               ROUND(AVG(rvol_slot_20)::numeric, 2),
+                               ROUND(AVG(ib_range)::numeric, 2)
+                        FROM candles_1min_first_hour
+                        WHERE timestamp ::date = CURRENT_DATE
+                        """)
             row = cur.fetchone()
             if row and row[0] > 0:
                 print(f"\nFirst Hour 1-Min Quality (today):")
                 print(f"  Total: {row[0]}")
-                print(f"  SlotRVOL: {row[1]} ({100*row[1]/row[0]:.1f}%)")
-                print(f"  CumRVOL: {row[2]} ({100*row[2]/row[0]:.1f}%)")
-                print(f"  IB metrics: {row[3]} ({100*row[3]/row[0]:.1f}%)")
+                print(f"  SlotRVOL: {row[1]} ({100 * row[1] / row[0]:.1f}%)")
+                print(f"  CumRVOL: {row[2]} ({100 * row[2] / row[0]:.1f}%)")
+                print(f"  IB metrics: {row[3]} ({100 * row[3] / row[0]:.1f}%)")
                 print(f"  AvgSlotRVOL: {row[4]}, AvgIBRange: {row[5]}")
 
             # 5min quality
             cur.execute("""
-                SELECT COUNT(*),
-                       COUNT(rvol_slot_20),
-                       COUNT(intraday_rvol_20),
-                       ROUND(AVG(rvol_slot_20)::numeric, 2),
-                       ROUND(AVG(intraday_rvol_20)::numeric, 2),
-                       COUNT(ema_8),
-                       COUNT(ema_39),
-                       COUNT(ema_50),
-                       COUNT(ema_39_slope),
-                       COUNT(ema_50_slope)
-                FROM candles_5min
-                WHERE timestamp::date = CURRENT_DATE
-            """)
+                        SELECT COUNT(*),
+                               COUNT(rvol_slot_20),
+                               COUNT(intraday_rvol_20),
+                               ROUND(AVG(rvol_slot_20)::numeric, 2),
+                               ROUND(AVG(intraday_rvol_20)::numeric, 2),
+                               COUNT(ema_8),
+                               COUNT(ema_39),
+                               COUNT(ema_50),
+                               COUNT(ema_39_slope),
+                               COUNT(ema_50_slope)
+                        FROM candles_5min
+                        WHERE timestamp ::date = CURRENT_DATE
+                        """)
             row = cur.fetchone()
 
             if row and row[0] > 0:
                 print(f"\nQuality (today's 5min):")
                 print(f"  Total: {row[0]}")
-                print(f"  SlotRVOL: {row[1]} ({100*row[1]/row[0]:.1f}%)")
-                print(f"  IntradayRVOL: {row[2]} ({100*row[2]/row[0]:.1f}%)")
+                print(f"  SlotRVOL: {row[1]} ({100 * row[1] / row[0]:.1f}%)")
+                print(f"  IntradayRVOL: {row[2]} ({100 * row[2] / row[0]:.1f}%)")
                 print(f"  AvgSlot: {row[3]}, AvgIntraday: {row[4]}")
-                print(f"  EMA8: {row[5]} ({100*row[5]/row[0]:.1f}%)")
-                print(f"  EMA39: {row[6]} ({100*row[6]/row[0]:.1f}%)")
-                print(f"  EMA50: {row[7]} ({100*row[7]/row[0]:.1f}%)")
-                print(f"  EMA39 Slope: {row[8]} ({100*row[8]/row[0]:.1f}%)")
-                print(f"  EMA50 Slope: {row[9]} ({100*row[9]/row[0]:.1f}%)")
+                print(f"  EMA8: {row[5]} ({100 * row[5] / row[0]:.1f}%)")
+                print(f"  EMA39: {row[6]} ({100 * row[6] / row[0]:.1f}%)")
+                print(f"  EMA50: {row[7]} ({100 * row[7] / row[0]:.1f}%)")
+                print(f"  EMA39 Slope: {row[8]} ({100 * row[8] / row[0]:.1f}%)")
+                print(f"  EMA50 Slope: {row[9]} ({100 * row[9] / row[0]:.1f}%)")
 
             # 15min quality
             cur.execute("""
-                SELECT COUNT(*),
-                       COUNT(rvol_slot_20),
-                       COUNT(intraday_rvol_20),
-                       ROUND(AVG(rvol_slot_20)::numeric, 2),
-                       ROUND(AVG(intraday_rvol_20)::numeric, 2),
-                       COUNT(ema_8),
-                       COUNT(ema_39),
-                       COUNT(ema_50),
-                       COUNT(ema_39_slope),
-                       COUNT(ema_50_slope)
-                FROM candles_15min
-                WHERE timestamp::date = CURRENT_DATE
-            """)
+                        SELECT COUNT(*),
+                               COUNT(rvol_slot_20),
+                               COUNT(intraday_rvol_20),
+                               ROUND(AVG(rvol_slot_20)::numeric, 2),
+                               ROUND(AVG(intraday_rvol_20)::numeric, 2),
+                               COUNT(ema_8),
+                               COUNT(ema_39),
+                               COUNT(ema_50),
+                               COUNT(ema_39_slope),
+                               COUNT(ema_50_slope)
+                        FROM candles_15min
+                        WHERE timestamp ::date = CURRENT_DATE
+                        """)
             row = cur.fetchone()
 
             if row and row[0] > 0:
                 print(f"\nQuality (today's 15min):")
                 print(f"  Total: {row[0]}")
-                print(f"  SlotRVOL: {row[1]} ({100*row[1]/row[0]:.1f}%)")
-                print(f"  IntradayRVOL: {row[2]} ({100*row[2]/row[0]:.1f}%)")
+                print(f"  SlotRVOL: {row[1]} ({100 * row[1] / row[0]:.1f}%)")
+                print(f"  IntradayRVOL: {row[2]} ({100 * row[2] / row[0]:.1f}%)")
                 print(f"  AvgSlot: {row[3]}, AvgIntraday: {row[4]}")
-                print(f"  EMA8: {row[5]} ({100*row[5]/row[0]:.1f}%)")
-                print(f"  EMA39: {row[6]} ({100*row[6]/row[0]:.1f}%)")
-                print(f"  EMA50: {row[7]} ({100*row[7]/row[0]:.1f}%)")
-                print(f"  EMA39 Slope: {row[8]} ({100*row[8]/row[0]:.1f}%)")
-                print(f"  EMA50 Slope: {row[9]} ({100*row[9]/row[0]:.1f}%)")
+                print(f"  EMA8: {row[5]} ({100 * row[5] / row[0]:.1f}%)")
+                print(f"  EMA39: {row[6]} ({100 * row[6] / row[0]:.1f}%)")
+                print(f"  EMA50: {row[7]} ({100 * row[7] / row[0]:.1f}%)")
+                print(f"  EMA39 Slope: {row[8]} ({100 * row[8] / row[0]:.1f}%)")
+                print(f"  EMA50 Slope: {row[9]} ({100 * row[9] / row[0]:.1f}%)")
 
             # Daily bars TrendEngine quality
             cur.execute("""
-                SELECT COUNT(*),
-                       COUNT(ema_39),
-                       COUNT(ema_50),
-                       COUNT(ema_39_slope),
-                       COUNT(adx),
-                       COUNT(adx_slope),
-                       COUNT(di_plus),
-                       ROUND(AVG(adx)::numeric, 2)
-                FROM daily_bars
-                WHERE timestamp >= CURRENT_DATE - INTERVAL '7 days'
-            """)
+                        SELECT COUNT(*),
+                               COUNT(ema_39),
+                               COUNT(ema_50),
+                               COUNT(ema_39_slope),
+                               COUNT(adx),
+                               COUNT(adx_slope),
+                               COUNT(di_plus),
+                               ROUND(AVG(adx)::numeric, 2)
+                        FROM daily_bars
+                        WHERE timestamp >= CURRENT_DATE - INTERVAL '7 days'
+                        """)
             row = cur.fetchone()
 
             if row and row[0] > 0:
                 print(f"\nTrendEngine Quality (last 7 days daily_bars):")
                 print(f"  Total: {row[0]}")
-                print(f"  EMA39: {row[1]} ({100*row[1]/row[0]:.1f}%)")
-                print(f"  EMA50: {row[2]} ({100*row[2]/row[0]:.1f}%)")
-                print(f"  EMA39 Slope: {row[3]} ({100*row[3]/row[0]:.1f}%)")
-                print(f"  ADX: {row[4]} ({100*row[4]/row[0]:.1f}%)")
-                print(f"  ADX Slope: {row[5]} ({100*row[5]/row[0]:.1f}%)")
-                print(f"  DI+: {row[6]} ({100*row[6]/row[0]:.1f}%)")
+                print(f"  EMA39: {row[1]} ({100 * row[1] / row[0]:.1f}%)")
+                print(f"  EMA50: {row[2]} ({100 * row[2] / row[0]:.1f}%)")
+                print(f"  EMA39 Slope: {row[3]} ({100 * row[3] / row[0]:.1f}%)")
+                print(f"  ADX: {row[4]} ({100 * row[4] / row[0]:.1f}%)")
+                print(f"  ADX Slope: {row[5]} ({100 * row[5] / row[0]:.1f}%)")
+                print(f"  DI+: {row[6]} ({100 * row[6] / row[0]:.1f}%)")
                 print(f"  Avg ADX: {row[7]}")
 
         finally:

@@ -82,7 +82,7 @@ load_dotenv()
 
 PG_DSN = os.getenv(
     "MARKET_DATA_PG_DSN",
-    "dbname=testmarket user=postgres password=postgres host=localhost port=5432",
+    "dbname=market_data user=postgres password=postgres host=localhost port=5432",
 )
 
 TICKERS_FILE = "ticker_list.txt"
@@ -312,6 +312,18 @@ class AlpacaDataCollectorOptimized:
                             ema_39
                             DOUBLE
                             PRECISION,
+                            ema_50
+                            DOUBLE
+                            PRECISION,
+                            ema_39_slope
+                            DOUBLE
+                            PRECISION,
+                            ema_50_slope
+                            DOUBLE
+                            PRECISION,
+                            atr
+                            DOUBLE
+                            PRECISION,
                             slot_index
                             SMALLINT,
                             cum_volume
@@ -363,6 +375,7 @@ class AlpacaDataCollectorOptimized:
                 ("ema_50", "DOUBLE PRECISION"),
                 ("ema_39_slope", "DOUBLE PRECISION"),
                 ("ema_50_slope", "DOUBLE PRECISION"),
+                ("atr", "DOUBLE PRECISION"),  # ATR(12) for 5-min candles
             ]
             for col_name, col_type in new_columns_5min:
                 cur.execute(f"ALTER TABLE candles_5min ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
@@ -419,6 +432,18 @@ class AlpacaDataCollectorOptimized:
                             ema_39
                             DOUBLE
                             PRECISION,
+                            ema_50
+                            DOUBLE
+                            PRECISION,
+                            ema_39_slope
+                            DOUBLE
+                            PRECISION,
+                            ema_50_slope
+                            DOUBLE
+                            PRECISION,
+                            atr
+                            DOUBLE
+                            PRECISION,
                             slot_index
                             SMALLINT,
                             cum_volume
@@ -470,11 +495,12 @@ class AlpacaDataCollectorOptimized:
                 ("ema_50", "DOUBLE PRECISION"),
                 ("ema_39_slope", "DOUBLE PRECISION"),
                 ("ema_50_slope", "DOUBLE PRECISION"),
+                ("atr", "DOUBLE PRECISION"),  # ATR(8) for 15-min candles
             ]
             for col_name, col_type in new_columns_15min:
                 cur.execute(f"ALTER TABLE candles_15min ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
 
-            # NEW: candles_1min_first_hour - First hour 1-minute candles
+            # candles_1min_first_hour - First hour 1-minute candles
             cur.execute("""
                         CREATE TABLE IF NOT EXISTS candles_1min_first_hour
                         (
@@ -517,8 +543,6 @@ class AlpacaDataCollectorOptimized:
                             vwap
                             DOUBLE
                             PRECISION,
-
-                            -- EMAs
                             ema_8
                             DOUBLE
                             PRECISION,
@@ -537,8 +561,6 @@ class AlpacaDataCollectorOptimized:
                             ema_50_slope
                             DOUBLE
                             PRECISION,
-
-                            -- Slot RVOL (within first hour context)
                             slot_index
                             SMALLINT,
                             cum_volume
@@ -549,16 +571,12 @@ class AlpacaDataCollectorOptimized:
                             rvol_slot_baseline_20
                             DOUBLE
                             PRECISION,
-
-                            -- Cumulative RVOL (within first hour)
                             rvol_cum_20
                             DOUBLE
                             PRECISION,
                             rvol_cum_baseline_20
                             DOUBLE
                             PRECISION,
-
-                            -- Initial Balance metrics (computed at end of first hour)
                             ib_high
                             DOUBLE
                             PRECISION,
@@ -568,7 +586,6 @@ class AlpacaDataCollectorOptimized:
                             ib_range
                             DOUBLE
                             PRECISION,
-
                             created_at
                             TIMESTAMP
                             DEFAULT
@@ -654,7 +671,60 @@ class AlpacaDataCollectorOptimized:
                             ema_20
                             DOUBLE
                             PRECISION,
+                            ema_39
+                            DOUBLE
+                            PRECISION,
+                            ema_50
+                            DOUBLE
+                            PRECISION,
+                            ema_39_slope
+                            DOUBLE
+                            PRECISION,
+                            ema_50_slope
+                            DOUBLE
+                            PRECISION,
                             ema_39_of_15min
+                            DOUBLE
+                            PRECISION,
+                            adx
+                            DOUBLE
+                            PRECISION,
+                            adx_sma
+                            DOUBLE
+                            PRECISION,
+                            adx_slope
+                            DOUBLE
+                            PRECISION,
+                            di_plus
+                            DOUBLE
+                            PRECISION,
+                            di_minus
+                            DOUBLE
+                            PRECISION,
+                            ib_high
+                            DOUBLE
+                            PRECISION,
+                            ib_low
+                            DOUBLE
+                            PRECISION,
+                            ib_range
+                            DOUBLE
+                            PRECISION,
+                            ib_volume
+                            BIGINT,
+                            ib_break_up
+                            BOOLEAN,
+                            ib_break_down
+                            BOOLEAN,
+                            close_vs_ib
+                            TEXT,
+                            atr_15min_ratio_10d
+                            DOUBLE
+                            PRECISION,
+                            ib_range_ratio_10d
+                            DOUBLE
+                            PRECISION,
+                            avg_daily_volume_20
                             DOUBLE
                             PRECISION,
                             created_at
@@ -680,6 +750,20 @@ class AlpacaDataCollectorOptimized:
                 ("adx_slope", "DOUBLE PRECISION"),
                 ("di_plus", "DOUBLE PRECISION"),
                 ("di_minus", "DOUBLE PRECISION"),
+                # IB metrics from first 15-min candle
+                ("ib_high", "DOUBLE PRECISION"),
+                ("ib_low", "DOUBLE PRECISION"),
+                ("ib_range", "DOUBLE PRECISION"),
+                ("ib_volume", "BIGINT"),
+                # Outcome tracking
+                ("ib_break_up", "BOOLEAN"),
+                ("ib_break_down", "BOOLEAN"),
+                ("close_vs_ib", "TEXT"),
+                # Precomputed ratios
+                ("atr_15min_ratio_10d", "DOUBLE PRECISION"),
+                ("ib_range_ratio_10d", "DOUBLE PRECISION"),
+                # Volume metrics (from intraday tables for normalized access)
+                ("avg_daily_volume_20", "DOUBLE PRECISION"),
             ]
             for col_name, col_type in new_daily_columns:
                 cur.execute(f"ALTER TABLE daily_bars ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
@@ -1387,6 +1471,38 @@ class AlpacaDataCollectorOptimized:
 
         return df
 
+    def calculate_intraday_atr(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """
+        Calculate ATR for intraday candles.
+
+        Args:
+            df: DataFrame with OHLC data
+            period: ATR period (8 for 15-min, 12 for 5-min)
+
+        Returns:
+            DataFrame with 'atr' column added
+        """
+        if df.empty or len(df) < period + 1:
+            df["atr"] = np.nan
+            return df
+
+        df = df.copy()
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        # True Range calculation
+        df["high_low"] = df["high"] - df["low"]
+        df["high_pc"] = abs(df["high"] - df["close"].shift(1))
+        df["low_pc"] = abs(df["low"] - df["close"].shift(1))
+        df["true_range"] = df[["high_low", "high_pc", "low_pc"]].max(axis=1)
+
+        # ATR using RMA (TradingView's Wilder smoothing: alpha = 1/period)
+        df["atr"] = df["true_range"].ewm(alpha=1 / period, adjust=False).mean().round(4)
+
+        # Clean up intermediate columns
+        df = df.drop(["high_low", "high_pc", "low_pc", "true_range"], axis=1, errors="ignore")
+
+        return df
+
     def calculate_adx_daily(
             self,
             df: pd.DataFrame,
@@ -1604,8 +1720,10 @@ class AlpacaDataCollectorOptimized:
             timeframe=TimeFrame(1, TimeFrameUnit.Minute),
             start=session_start.isoformat(),
             end=session_end.isoformat(),
-            adjustment=Adjustment.ALL
+            adjustment=Adjustment.SPLIT
         )
+
+
 
         try:
             self.api_call_count += 1
@@ -1964,7 +2082,7 @@ class AlpacaDataCollectorOptimized:
                 start=start_date.isoformat(),
                 end=end_date.isoformat(),
                 feed="iex",
-                adjustment=Adjustment.ALL)
+                adjustment=Adjustment.SPLIT)
 
             self.api_call_count += 1
             bars = self.client.get_stock_bars(request)
@@ -2039,7 +2157,7 @@ class AlpacaDataCollectorOptimized:
         df["low_pc"] = abs(df["low"] - df["close"].shift(1))
         df["true_range"] = df[["high_low", "high_pc", "low_pc"]].max(axis=1)
 
-        df["atr"] = df["true_range"].ewm(span=10, adjust=False).mean()
+        df["atr"] = df["true_range"].ewm(alpha=1 / 10, adjust=False).mean()  # RMA (TradingView)
 
         df = self.calculate_rsi(df, period=10)
         df = self.calculate_momentum(df, period=10)
@@ -2090,7 +2208,7 @@ class AlpacaDataCollectorOptimized:
             timeframe=timeframe,
             start=start_date.isoformat(),
             end=end_date.isoformat(),
-            adjustment=Adjustment.ALL)
+            adjustment=Adjustment.SPLIT)
 
         try:
             self.api_call_count += 1
@@ -2115,8 +2233,10 @@ class AlpacaDataCollectorOptimized:
 
             if is_5min:
                 market_hours_df = self.calculate_rvol_5m(market_hours_df, lookback_sessions=RVOL_LOOKBACK_SESSIONS)
+                market_hours_df = self.calculate_intraday_atr(market_hours_df, period=12)  # ATR(12) for 5-min
             elif is_15min:
                 market_hours_df = self.calculate_rvol_15m(market_hours_df, lookback_sessions=RVOL_LOOKBACK_SESSIONS)
+                market_hours_df = self.calculate_intraday_atr(market_hours_df, period=8)  # ATR(8) for 15-min
 
             available_columns = [
                 "symbol", "timestamp", "open", "high", "low", "close", "volume", "vwap",
@@ -2127,7 +2247,7 @@ class AlpacaDataCollectorOptimized:
                 available_columns += [
                     "slot_index", "cum_volume", "rvol_slot_20", "rvol_slot_baseline_20",
                     "rvol_cum_20", "rvol_cum_baseline_20", "intraday_rvol_20",
-                    "avg_daily_volume_20", "pct_of_day_typical",
+                    "avg_daily_volume_20", "pct_of_day_typical", "atr",
                 ]
 
             market_hours_df = market_hours_df[[c for c in available_columns if c in market_hours_df.columns]]
@@ -2307,6 +2427,12 @@ class AlpacaDataCollectorOptimized:
                 "poc", "atr", "rsi_10", "momentum_10", "ema_8", "ema_20", "ema_39_of_15min",
                 "ema_39", "ema_50", "ema_39_slope", "ema_50_slope",
                 "adx", "adx_sma", "adx_slope", "di_plus", "di_minus",
+                # IB metrics
+                "ib_high", "ib_low", "ib_range", "ib_volume",
+                # Outcome tracking
+                "ib_break_up", "ib_break_down", "close_vs_ib",
+                # Precomputed ratios
+                "atr_15min_ratio_10d", "ib_range_ratio_10d",
             ]
             col_list = ",".join(columns)
             placeholders = ",".join(["%s"] * len(columns))
@@ -2329,6 +2455,12 @@ class AlpacaDataCollectorOptimized:
                     bar.get("ema_39"), bar.get("ema_50"), bar.get("ema_39_slope"), bar.get("ema_50_slope"),
                     bar.get("adx"), bar.get("adx_sma"), bar.get("adx_slope"),
                     bar.get("di_plus"), bar.get("di_minus"),
+                    # IB metrics
+                    bar.get("ib_high"), bar.get("ib_low"), bar.get("ib_range"), bar.get("ib_volume"),
+                    # Outcome tracking
+                    bar.get("ib_break_up"), bar.get("ib_break_down"), bar.get("close_vs_ib"),
+                    # Precomputed ratios
+                    bar.get("atr_15min_ratio_10d"), bar.get("ib_range_ratio_10d"),
                 ]
                 for bar in all_records
             ]
@@ -2385,6 +2517,192 @@ class AlpacaDataCollectorOptimized:
             cur.close()
             conn.close()
 
+    def update_daily_bars_with_ib_metrics(self, symbols: List[str]):
+        """
+        Update daily_bars with IB metrics from the first 15-min candle of each day.
+
+        IB (Initial Balance) = first 15-min candle:
+        - ib_high, ib_low, ib_range, ib_volume
+        - ib_break_up: True if day's high > ib_high
+        - ib_break_down: True if day's low < ib_low
+        - close_vs_ib: 'above' / 'within' / 'below'
+        """
+        if not symbols:
+            return
+
+        conn = self._get_pg_conn()
+        cur = conn.cursor()
+        try:
+            # Get first 15-min candle (slot_index = 0) for each day
+            cur.execute(
+                """
+                WITH first_candle AS (SELECT DISTINCT
+                ON (symbol, timestamp :: date)
+                    symbol,
+                    timestamp :: date as trade_date,
+                    high as ib_high,
+                    low as ib_low,
+                    high - low as ib_range,
+                    volume as ib_volume
+                FROM candles_15min
+                WHERE symbol = ANY (%s)
+                  AND slot_index = 0
+                ORDER BY symbol, timestamp :: date, timestamp
+                    ),
+                    day_stats AS (
+                SELECT
+                    symbol, timestamp :: date as trade_date, MAX (high) as day_high, MIN (low) as day_low, (array_agg(close ORDER BY timestamp DESC))[1] as day_close
+                FROM candles_15min
+                WHERE symbol = ANY (%s)
+                GROUP BY symbol, timestamp :: date
+                    )
+                UPDATE daily_bars d
+                SET ib_high       = fc.ib_high,
+                    ib_low        = fc.ib_low,
+                    ib_range      = fc.ib_range,
+                    ib_volume     = fc.ib_volume,
+                    ib_break_up   = (ds.day_high > fc.ib_high),
+                    ib_break_down = (ds.day_low < fc.ib_low),
+                    close_vs_ib   = CASE
+                                        WHEN ds.day_close > fc.ib_high THEN 'above'
+                                        WHEN ds.day_close < fc.ib_low THEN 'below'
+                                        ELSE 'within'
+                        END FROM first_candle fc
+                JOIN day_stats ds
+                ON fc.symbol = ds.symbol AND fc.trade_date = ds.trade_date
+                WHERE d.symbol = fc.symbol
+                  AND d.timestamp = fc.trade_date;
+                """,
+                (symbols, symbols),
+            )
+            conn.commit()
+            logging.info(f"Updated IB metrics in daily_bars for {len(symbols)} symbols")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error updating IB metrics: {e}")
+        finally:
+            cur.close()
+            conn.close()
+
+    def update_daily_bars_with_ratios(self, symbols: List[str], lookback_days: int = 10):
+        """
+        Update daily_bars with precomputed ratios:
+        - atr_15min_ratio_10d: today's last ATR from 15min / SMA(last 10 days' ATR)
+        - ib_range_ratio_10d: today's ib_range / SMA(last 10 days' ib_range)
+        """
+        if not symbols:
+            return
+
+        conn = self._get_pg_conn()
+        cur = conn.cursor()
+        try:
+            # ATR ratio from 15-min candles (using last ATR of each day)
+            cur.execute(
+                """
+                WITH daily_atr AS (SELECT DISTINCT
+                ON (symbol, timestamp :: date)
+                    symbol,
+                    timestamp :: date as trade_date,
+                    atr as atr_15min
+                FROM candles_15min
+                WHERE symbol = ANY (%s)
+                  AND atr IS NOT NULL
+                ORDER BY symbol, timestamp :: date, timestamp DESC
+                    ),
+                    atr_with_sma AS (
+                SELECT
+                    symbol, trade_date, atr_15min, AVG (atr_15min) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN %s PRECEDING AND 1 PRECEDING
+                    ) as atr_sma_10d
+                FROM daily_atr
+                    )
+                UPDATE daily_bars d
+                SET atr_15min_ratio_10d = ROUND((a.atr_15min / NULLIF(a.atr_sma_10d, 0)):: numeric, 4) FROM atr_with_sma a
+                WHERE d.symbol = a.symbol
+                  AND d.timestamp = a.trade_date
+                  AND a.atr_sma_10d IS NOT NULL;
+                """,
+                (symbols, lookback_days),
+            )
+
+            # IB range ratio
+            cur.execute(
+                """
+                WITH ib_with_sma AS (SELECT symbol,
+                    timestamp as trade_date
+                   , ib_range
+                   , AVG (ib_range) OVER (
+                    PARTITION BY symbol
+                    ORDER BY timestamp
+                    ROWS BETWEEN %s PRECEDING AND 1 PRECEDING
+                    ) as ib_range_sma_10d
+                FROM daily_bars
+                WHERE symbol = ANY (%s)
+                  AND ib_range IS NOT NULL
+                    )
+                UPDATE daily_bars d
+                SET ib_range_ratio_10d = ROUND((i.ib_range / NULLIF(i.ib_range_sma_10d, 0)):: numeric, 4) FROM ib_with_sma i
+                WHERE d.symbol = i.symbol
+                  AND d.timestamp = i.trade_date
+                  AND i.ib_range_sma_10d IS NOT NULL;
+                """,
+                (lookback_days, symbols),
+            )
+
+            conn.commit()
+            logging.info(f"Updated ATR and IB ratios in daily_bars for {len(symbols)} symbols")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error updating ratios: {e}")
+        finally:
+            cur.close()
+            conn.close()
+
+    def update_daily_bars_with_avg_volume(self, symbols: List[str]):
+        """
+        Update daily_bars with avg_daily_volume_20 from candles_15min.
+
+        This provides normalized access to the 20-day average daily volume
+        for real-time RVOL calculations.
+        """
+        if not symbols:
+            return
+
+        conn = self._get_pg_conn()
+        cur = conn.cursor()
+        try:
+            # Get the most recent avg_daily_volume_20 for each symbol/date from 15min candles
+            cur.execute(
+                """
+                WITH latest_avg_vol AS (SELECT DISTINCT
+                ON (symbol, timestamp :: date)
+                    symbol,
+                    timestamp :: date as trade_date,
+                    avg_daily_volume_20
+                FROM candles_15min
+                WHERE symbol = ANY (%s)
+                  AND avg_daily_volume_20 IS NOT NULL
+                ORDER BY symbol, timestamp :: date, timestamp DESC
+                    )
+                UPDATE daily_bars d
+                SET avg_daily_volume_20 = v.avg_daily_volume_20 FROM latest_avg_vol v
+                WHERE d.symbol = v.symbol
+                  AND d.timestamp = v.trade_date;
+                """,
+                (symbols,),
+            )
+
+            conn.commit()
+            logging.info(f"Updated avg_daily_volume_20 in daily_bars for {len(symbols)} symbols")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error updating avg_daily_volume_20: {e}")
+        finally:
+            cur.close()
+            conn.close()
+
     # -----------------------------------------------------------------------
     # Orchestration & summary
     # -----------------------------------------------------------------------
@@ -2430,6 +2748,15 @@ class AlpacaDataCollectorOptimized:
 
             # Backfill daily_bars.ema_39_of_15min
             self.update_daily_bars_with_ema39_of_15min(batch)
+
+            # Update IB metrics from first 15-min candle
+            self.update_daily_bars_with_ib_metrics(batch)
+
+            # Update ATR and IB ratios
+            self.update_daily_bars_with_ratios(batch, lookback_days=10)
+
+            # Update avg_daily_volume_20 from intraday tables
+            self.update_daily_bars_with_avg_volume(batch)
 
             batch_time = time.time() - batch_start_time
             logging.info(f"Batch completed in {batch_time:.2f} seconds")
